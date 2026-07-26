@@ -73,3 +73,115 @@
 (defn instances [asm] (:instances asm))
 (defn constraints [asm] (:constraints asm))
 (defn active-count [asm] (count (remove :suppressed (:instances asm))))
+
+;; ---------------------------------------------------------------------------
+;; Translation-only constraint solving (2026-07-27).
+;;
+;; `solve` above validates that constraints reference existing instances and
+;; nothing else — the namespace docstring is explicit that "the constraint
+;; solver itself is a documented TODO, iterative Newton-Raphson on 6-DOF
+;; transforms". That is honest, but it means adding constraints to an assembly
+;; changes nothing geometrically, so a caller can believe an assembly is
+;; constrained when it is not.
+;;
+;; A full 6-DOF solver is a real project. What is added here is the subset that
+;; covers axis-aligned mechanical assembly — the case that actually occurs when
+;; parts bolt to a chassis: **translation only, along one coordinate axis, with
+;; explicit numeric targets.** Rotation is untouched and explicitly refused.
+;;
+;; Constraint semantics implemented (all take `:axis` 0|1|2 and operate on
+;; `{:translate [x y z]}` transforms):
+;;   :distance  — instance-b's axis coordinate is set to a's plus `:distance`
+;;   :mate      — coincident along the axis (distance 0)
+;;   :align     — same as mate here; a distinct meaning needs face geometry
+;;
+;; Solving is Gauss-Seidel sweeps over the constraint list: each pass moves the
+;; dependent instance to satisfy its constraint, repeated until the largest
+;; correction falls under `tol` or `max-iters` is hit. For a consistent,
+;; non-cyclic set this converges in one pass; cycles either converge to a
+;; compromise or hit the iteration cap, and the cap being hit is REPORTED, not
+;; swallowed — an unconverged solve returns `:unconverged` with the residual.
+;; ---------------------------------------------------------------------------
+
+(defn- translate-of [inst]
+  (let [t (:transform inst)]
+    (if (and (map? t) (vector? (:translate t))) (mapv double (:translate t)) nil)))
+
+(def solvable-kinds
+  "Constraint kinds `solve-translations` understands. Anything else present in
+  the assembly makes the solve refuse rather than ignore it."
+  #{:mate :align :distance})
+
+(defn solve-translations
+  "Solve axis-aligned translation constraints. Returns
+  `{:status :ok|:unconverged|:error :assembly asm' :iterations n :residual r
+    :message msg}`.
+
+  Requirements, each of which produces `:error` rather than a quiet skip:
+  - every instance transform is `{:translate [x y z]}` (`:identity` is not a
+    translation this solver can move — make it explicit)
+  - every constraint kind is in `solvable-kinds`
+  - every constraint carries an `:axis` of 0, 1 or 2
+
+  Rotation is never modified. `:angle` and `:insert` constraints are refused
+  by the kind check above, because honouring them needs orientation."
+  ([asm] (solve-translations asm 1e-9 64))
+  ([asm tol max-iters]
+   (let [insts (:instances asm)
+         ids (into #{} (map :id insts))
+         bad-tf (remove translate-of insts)
+         cs (:constraints asm)
+         bad-kind (remove #(solvable-kinds (:kind %)) cs)
+         bad-axis (remove #(#{0 1 2} (:axis %)) cs)
+         missing (remove (fn [c] (and (ids (:instance-a c)) (ids (:instance-b c)))) cs)]
+     (cond
+       (seq bad-tf)
+       {:status :error :assembly asm
+        :message (str "solve-translations: instance(s) "
+                      (mapv :id bad-tf)
+                      " have no {:translate [x y z]} transform")}
+
+       (seq missing)
+       {:status :error :assembly asm
+        :message (str "solve-translations: constraint references unknown instance: "
+                      (first missing))}
+
+       (seq bad-kind)
+       {:status :error :assembly asm
+        :message (str "solve-translations: unsupported constraint kind(s) "
+                      (vec (distinct (map :kind bad-kind)))
+                      " — only " (vec (sort solvable-kinds))
+                      " are solvable (rotation is not implemented)")}
+
+       (seq bad-axis)
+       {:status :error :assembly asm
+        :message "solve-translations: every constraint needs :axis 0, 1 or 2"}
+
+       :else
+       (loop [pos (into {} (map (juxt :id translate-of)) insts)
+              iter 0]
+         (let [[pos' worst]
+               (reduce
+                (fn [[p w] c]
+                  (let [a (:instance-a c) b (:instance-b c)
+                        ax (:axis c)
+                        d (double (case (:kind c) :distance (or (:distance c) 0.0) 0.0))
+                        target (+ (nth (p a) ax) d)
+                        cur (nth (p b) ax)
+                        delta (- target cur)]
+                    [(assoc p b (assoc (p b) ax target))
+                     (max w (Math/abs delta))]))
+                [pos 0.0] cs)]
+           (if (or (<= worst tol) (>= iter max-iters))
+             {:status (if (<= worst tol) :ok :unconverged)
+              :iterations (inc iter)
+              :residual worst
+              :message (if (<= worst tol)
+                         "converged"
+                         (str "hit max-iters " max-iters " with residual " worst
+                              " — the constraint set is likely cyclic or"
+                              " over-determined"))
+              :assembly
+              (assoc asm :instances
+                     (mapv (fn [i] (assoc i :transform {:translate (pos' (:id i))})) insts))}
+             (recur pos' (inc iter)))))))))
