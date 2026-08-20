@@ -10,6 +10,7 @@
   using the same keywords without an explicit inter-repo dependency."
   (:require [brep.kernel :as k]
             [brep.tessellate :as tess]
+            [brep.polygon :as poly]
             [brep.mesh-csg :as csg]))
 
 (def boolean-ops #{:new :add :cut :intersect})
@@ -390,53 +391,195 @@
   (let [[positions indices] (tess/tessellate-solid solid edges verts)]
     {:positions positions :indices indices}))
 
+(defn- combine
+  "Fold one feature's own geometry into the accumulated mesh, per its
+  `:operation`. `:new` (or nil) replaces; the boolean operations need an
+  accumulator to act on."
+  [acc mesh operation]
+  (if (nil? acc)
+    (if (contains? #{:add :cut :intersect} operation)
+      [:error "no base geometry to apply boolean to"]
+      [:ok mesh])
+    [:ok (csg/mesh-boolean (case operation :add :union :cut :difference
+                                 :intersect :intersection :union)
+                           acc mesh)]))
+
+(defn- translate-mesh [mesh [dx dy dz]]
+  (update mesh :positions (fn [ps] (mapv (fn [[x y z]] [(+ x dx) (+ y dy) (+ z dz)]) ps))))
+
+;; ---------------------------------------------------------------------------
+;; The feature registry.
+;;
+;; `apply-feature` is `state + feature -> state`: it takes the accumulated mesh
+;; (nil before the first solid) and returns the next one. **Registering a method
+;; here IS the claim that this kernel evaluates that feature kind.** There is no
+;; second list of "supported kinds" to drift out of step with the constructors
+;; above — the constructors describe a feature tree, this multimethod describes
+;; what can be built from one, and `supported-feature-kinds` derives the answer
+;; from the registry rather than restating it.
+;;
+;; The `:default` method refuses and names what IS registered, the same shape
+;; `cae.solver/solve` uses in kotoba-lang/kami-engine-cae-solver. A caller that
+;; asks for an unimplemented feature gets a structured error naming the gap, not
+;; silence and not a plausible-looking wrong shape.
+;; ---------------------------------------------------------------------------
+
+(defmulti apply-feature
+  "Fold `feature` into the accumulated mesh `acc`. `ctx` carries `:sketches`
+  (id -> sketch feature) and `:entries` (the tree's entries, for features that
+  refer to earlier ones). Returns `[:ok mesh]` or `[:error msg]`."
+  (fn [feature _ctx _acc] (:kind feature)))
+
+(defn supported-feature-kinds
+  "The feature kinds this kernel can actually evaluate — read off the registry,
+  never maintained by hand."
+  []
+  (disj (set (keys (methods apply-feature))) :default))
+
+(defmethod apply-feature :default [feature _ctx _acc]
+  [:error (str "brep.feature: no evaluator is registered for feature kind "
+               (:kind feature) " (feature " (:id feature) "). Registered: "
+               (pr-str (vec (sort (supported-feature-kinds)))) ".")])
+
+;; A sketch carries no geometry of its own; it is the profile other features cite.
+(defmethod apply-feature :sketch [_feature _ctx acc] [:ok acc])
+
+(defmethod apply-feature :extrude [feature {:keys [sketches]} acc]
+  (let [sk (get sketches (:sketch-ref feature))
+        ring (when sk (sketch->ring sk))]
+    (if-not ring
+      [:error (str "extrude " (:id feature) " needs a sketch that is a single"
+                   " closed loop of straight segments")]
+      (combine acc
+               (solid->mesh (extrude-prism 1 ring (:plane sk)
+                                           (:direction feature) (:distance feature)))
+               (:operation feature)))))
+
+(defmethod apply-feature :pattern [feature {:keys [entries]} acc]
+  (let [{:keys [source-features direction count spacing]} feature
+        solid-ids (->> entries (map :feature) (remove #(= :sketch (:kind %)))
+                       (remove #(= :pattern (:kind %))) (map :id) set)
+        covered (set source-features)
+        n (long (or count 0))
+        step (double (or spacing 0))
+        [dx dy dz] (or direction [0 0 0])
+        len (Math/sqrt (+ (* dx dx) (* dy dy) (* dz dz)))]
+    (cond
+      (nil? acc)
+      [:error (str "pattern " (:id feature) " has no geometry to repeat")]
+
+      (< n 2)
+      [:error (str "pattern " (:id feature) " needs :count >= 2 (got " count ")")]
+
+      (or (zero? len) (not (pos? step)))
+      [:error (str "pattern " (:id feature) " needs a non-zero :direction and a"
+                   " positive :spacing (got " (pr-str direction) ", " spacing ")")]
+
+      ;; Selective patterning would require evaluating a SUBSET of the tree in
+      ;; isolation. This evaluator folds features into one accumulator, so it can
+      ;; only repeat everything built so far. Refuse rather than silently
+      ;; patterning more than was asked for.
+      (not= covered solid-ids)
+      [:error (str "pattern " (:id feature) " names :source-features "
+                   (pr-str (vec (sort covered))) " but this evaluator can only"
+                   " repeat the whole accumulated body, which is built from "
+                   (pr-str (vec (sort solid-ids)))
+                   ". Selective patterning is not implemented.")]
+
+      :else
+      (let [unit [(/ dx len) (/ dy len) (/ dz len)]]
+        [:ok (reduce (fn [m i]
+                       (csg/mesh-boolean
+                        :union m
+                        (translate-mesh acc (mapv #(* % step i) unit))))
+                     acc
+                     (range 1 n))]))))
+
+(defmethod apply-feature :loft [feature {:keys [sketches]} acc]
+  (let [refs (:profiles feature)
+        sks (mapv #(get sketches %) refs)
+        rings (mapv #(when % (sketch->ring %)) sks)
+        counts (mapv #(when % (count %)) rings)]
+    (cond
+      (< (count refs) 2)
+      [:error (str "loft " (:id feature) " needs at least 2 profiles (got "
+                   (count refs) ")")]
+
+      (some nil? rings)
+      [:error (str "loft " (:id feature) " needs every profile to be a sketch that"
+                   " is a single closed loop of straight segments; missing or"
+                   " unusable: "
+                   (pr-str (vec (keep (fn [[r id]] (when (nil? r) id))
+                                      (map vector rings refs)))))]
+
+      ;; Lofting between rings of different vertex counts needs a correspondence
+      ;; rule (resample, or match by arc length). That is a real algorithm with
+      ;; visible consequences for the surface, so refuse rather than invent one.
+      (not (apply = counts))
+      [:error (str "loft " (:id feature) " needs all profiles to have the same"
+                   " vertex count (got " (pr-str counts) "); automatic"
+                   " resampling is not implemented")]
+
+      :else
+      (let [n (first counts)
+            lifted (mapv (fn [sk ring] (mapv #(to-3d (:plane sk) %) ring)) sks rings)
+            positions (vec (apply concat lifted))
+            base (fn [pi] (* pi n))
+            ;; side walls: one quad per edge per adjacent profile pair
+            sides (vec (mapcat
+                        (fn [pi]
+                          (mapcat (fn [j]
+                                    (let [j2 (mod (inc j) n)
+                                          a (+ (base pi) j) b (+ (base pi) j2)
+                                          c (+ (base (inc pi)) j2) d (+ (base (inc pi)) j)]
+                                      [a b c a c d]))
+                                  (range n)))
+                        (range (dec (count lifted)))))
+            ;; caps: triangulated in the sketch plane so concave profiles work
+            cap (fn [pi reverse?]
+                  (let [sk (nth sks pi) ring (nth rings pi)
+                        {:keys [vertices indices]} (poly/triangulate-rings [ring])
+                        offset (count positions)
+                        pts (mapv #(to-3d (:plane sk) %) vertices)
+                        idx (mapv #(+ offset %) indices)]
+                    [pts (if reverse?
+                           (vec (mapcat (fn [[a b c]] [a c b]) (partition 3 idx)))
+                           (vec idx))]))
+            [first-pts first-idx] (cap 0 true)
+            positions (into positions first-pts)
+            [last-pts last-idx] (let [sk (nth sks (dec (count sks)))
+                                      ring (nth rings (dec (count rings)))
+                                      {:keys [vertices indices]} (poly/triangulate-rings [ring])
+                                      offset (count positions)]
+                                  [(mapv #(to-3d (:plane sk) %) vertices)
+                                   (mapv #(+ offset %) indices)])
+            positions (into positions last-pts)
+            mesh {:positions positions
+                  :indices (vec (concat sides first-idx last-idx))}]
+        (combine acc mesh (:operation feature))))))
+
 (defn evaluate-mesh
-  "Evaluate a feature tree to a **triangle mesh**, applying boolean features
-  via `brep.mesh-csg/mesh-boolean`.
+  "Evaluate a feature tree to a **triangle mesh** by folding each feature
+  through `apply-feature`.
 
-  Base features are evaluated as in `evaluate` (extrude from a real sketch
-  profile, revolve for the supported cylinder case) and then tessellated;
-  `:add`/`:cut`/`:intersect` map to `:union`/`:difference`/`:intersection`.
+  Which kinds are evaluable is answered by `supported-feature-kinds`, which
+  reads the registry — an unregistered kind returns a structured `[:error …]`
+  naming itself and the registered set, so a feature tree can never report
+  success for a shape that was not built.
 
-  Each boolean's operand is the feature's own base geometry: an `:extrude`
-  with `:operation :cut` extrudes its sketch, then subtracts that prism from
-  the accumulated result. Returns `[:ok {:positions :indices}]` or
-  `[:error msg]`.
+  Returns `[:ok {:positions :indices}]` or `[:error msg]`.
 
   Not STEP-exportable — see the note above."
   [tree]
-  (let [sketches (sketch-by-id (:entries tree))
-        base-of (fn [feature]
-                  (case (:kind feature)
-                    :extrude
-                    (let [sk (get sketches (:sketch-ref feature))
-                          ring (when sk (sketch->ring sk))]
-                      (if ring
-                        [:ok (extrude-prism 1 ring (:plane sk)
-                                            (:direction feature) (:distance feature))]
-                        [:error (str "evaluate-mesh: extrude " (:id feature)
-                                     " needs a sketch that is a single closed loop"
-                                     " of straight segments")]))
-                    [:error (str "evaluate-mesh: feature kind " (:kind feature)
-                                 " is not supported as a boolean operand")]))]
+  (let [ctx {:sketches (sketch-by-id (:entries tree))
+             :entries (remove :suppressed (:entries tree))}]
     (loop [entries (:entries tree) acc nil]
       (if (empty? entries)
         (if acc [:ok acc] [:error "feature tree produced no geometry"])
         (let [{:keys [feature suppressed]} (first entries)]
-          (cond
-            suppressed (recur (rest entries) acc)
-            (= :sketch (:kind feature)) (recur (rest entries) acc)
-            :else
-            (let [op (:operation feature)]
-              (if (and (nil? acc) (contains? #{:add :cut :intersect} op))
-                [:error "no base geometry to apply boolean to"]
-                (let [[st base] (base-of feature)]
-                  (if (= :error st)
-                    [st base]
-                    (let [m (solid->mesh base)]
-                      (if (nil? acc)
-                        (recur (rest entries) m)
-                        (let [csg-op (case op :add :union :cut :difference
-                                           :intersect :intersection :union)]
-                          (recur (rest entries)
-                                 (csg/mesh-boolean csg-op acc m)))))))))))))))
+          (if suppressed
+            (recur (rest entries) acc)
+            (let [[st v] (apply-feature feature ctx acc)]
+              (if (= :error st)
+                [:error v]
+                (recur (rest entries) v)))))))))
