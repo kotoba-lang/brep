@@ -15,6 +15,7 @@
   the difference of two such products), so these are verification tests, not
   change detectors."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as string]
             [brep.feature :as f]
             [brep.assembly :as a]
             [brep.kernel :as k]
@@ -221,3 +222,119 @@
       (is (= :unconverged (:status r)))
       (is (pos? (:residual r)))
       (is (re-find #"cyclic or" (:message r))))))
+
+;; ---------------------------------------------------------------------------
+;; The feature registry (2026-08-20).
+;;
+;; `apply-feature` is an open multimethod: registering a method IS the claim
+;; that this kernel evaluates that feature kind. Before this, the constructors
+;; above (`fillet-feature`, `sweep-feature`, …) read as capability while
+;; `evaluate-mesh` handled `:extrude` alone and answered everything else with a
+;; generic "not supported as a boolean operand" — a vocabulary and an evaluator
+;; kept as two lists that nothing compared. The tests below pin the property
+;; that replaces the second list: what is unregistered says so, by name.
+;; ---------------------------------------------------------------------------
+
+(defn- square-sketch [id plane s]
+  (f/sketch-feature
+   id plane
+   [(f/sketch-line [0 0] [s 0]) (f/sketch-line [s 0] [s s])
+    (f/sketch-line [s s] [0 s]) (f/sketch-line [0 s] [0 0])]))
+
+(defn- bbox [{:keys [positions]}]
+  [(mapv (fn [i] (apply min (map #(nth % i) positions))) [0 1 2])
+   (mapv (fn [i] (apply max (map #(nth % i) positions))) [0 1 2])])
+
+(deftest registry-answers-for-itself
+  (testing "the supported set is derived from the registry, not restated"
+    (is (contains? (f/supported-feature-kinds) :extrude))
+    (is (contains? (f/supported-feature-kinds) :sketch))
+    (is (not (contains? (f/supported-feature-kinds) :fillet))))
+
+  (testing "an unregistered kind refuses BY NAME and names what is registered"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                   (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new))
+                   (f/add-feature (f/fillet-feature 3 [1] 1.0)))
+          [status msg] (f/evaluate-mesh tree)]
+      (is (= :error status))
+      (is (string/includes? msg ":fillet"))
+      (is (string/includes? msg "no evaluator is registered"))
+      (is (string/includes? msg ":extrude"))
+      (is (string/includes? msg ":loft")))))
+
+(deftest loft-builds-a-frustum-between-two-profiles
+  (let [tree (-> (f/feature-tree)
+                 (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 6))
+                 (f/add-feature
+                  (square-sketch 2 (f/sketch-plane-custom [1.0 1.0 6.0] [0 0 1]) 4))
+                 (f/add-feature (f/loft-feature 3 [1 2] :new)))
+        [status mesh] (f/evaluate-mesh tree)]
+    (testing "it builds"
+      (is (= :ok status)))
+    (testing "the solid spans both profile planes"
+      (let [[[_ _ zmin] [_ _ zmax]] (bbox mesh)]
+        (is (= 0.0 (double zmin)))
+        (is (= 6.0 (double zmax)))))
+    (testing "side walls plus both caps, all triangles"
+      (is (zero? (mod (count (:indices mesh)) 3)))
+      (is (= 36 (count (:indices mesh)))))
+    (testing "every index addresses a position that exists"
+      (is (every? #(< -1 % (count (:positions mesh))) (:indices mesh)))))
+
+  (testing "mismatched vertex counts are refused, not silently resampled"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 6))
+                   (f/add-feature
+                    (f/sketch-feature 2 (f/sketch-plane-custom [0.0 0.0 5.0] [0 0 1])
+                                            [(f/sketch-line [0 0] [4 0])
+                                             (f/sketch-line [4 0] [2 4])
+                                             (f/sketch-line [2 4] [0 0])]))
+                   (f/add-feature (f/loft-feature 3 [1 2] :new)))
+          [status msg] (f/evaluate-mesh tree)]
+      (is (= :error status))
+      (is (string/includes? msg "same vertex count"))
+      (is (string/includes? msg "resampling is not implemented")))))
+
+(deftest pattern-repeats-the-body-along-a-direction
+  (let [base-tree (-> (f/feature-tree)
+                      (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                      (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new)))
+        [_ base] (f/evaluate-mesh base-tree)
+        [status mesh] (f/evaluate-mesh
+                       (f/add-feature base-tree
+                                            (f/pattern-feature 3 [2] [1 0 0] 3 10)))]
+    (testing "it builds"
+      (is (= :ok status)))
+    (testing "the bounding box grows by (count - 1) x spacing along the direction"
+      (let [[[x0 _ _] [x1 _ _]] (bbox base)
+            [[px0 _ _] [px1 _ _]] (bbox mesh)]
+        (is (= (double x0) (double px0)))
+        (is (= (+ (double x1) 20.0) (double px1)))))
+    (testing "the direction is normalised, so its length does not scale the spacing"
+      (let [[_ scaled] (f/evaluate-mesh
+                        (f/add-feature base-tree
+                                             (f/pattern-feature 3 [2] [7 0 0] 3 10)))]
+        (is (= (bbox mesh) (bbox scaled))))))
+
+  (testing "degenerate patterns are refused"
+    (let [t (-> (f/feature-tree)
+                (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new)))]
+      (is (= :error (first (f/evaluate-mesh
+                            (f/add-feature t (f/pattern-feature 3 [2] [1 0 0] 1 10))))))
+      (is (= :error (first (f/evaluate-mesh
+                            (f/add-feature t (f/pattern-feature 3 [2] [0 0 0] 3 10))))))
+      (is (= :error (first (f/evaluate-mesh
+                            (f/add-feature t (f/pattern-feature 3 [2] [1 0 0] 3 0))))))))
+
+  (testing "selective patterning is refused rather than over-applied"
+    (let [t (-> (f/feature-tree)
+                (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new))
+                (f/add-feature (square-sketch 4 (f/sketch-plane-xy) 2))
+                (f/add-feature (f/extrude-feature 5 4 [0 0 1] 9 :add))
+                (f/add-feature (f/pattern-feature 6 [2] [1 0 0] 3 10)))
+          [status msg] (f/evaluate-mesh t)]
+      (is (= :error status))
+      (is (string/includes? msg "Selective patterning is not implemented")))))
