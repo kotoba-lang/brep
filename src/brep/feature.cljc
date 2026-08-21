@@ -9,6 +9,7 @@
   independence rather than a hard crate dependency; this mirrors that by
   using the same keywords without an explicit inter-repo dependency."
   (:require [brep.kernel :as k]
+            [brep.topology :as topo]
             [brep.tessellate :as tess]
             [brep.polygon :as poly]
             [brep.mesh-csg :as csg]))
@@ -730,6 +731,92 @@
             mesh {:positions positions
                   :indices (vec (concat sides first-idx last-idx))}]
         (combine acc mesh (:operation feature))))))
+
+(defn- face-normal-of [{:keys [vertices faces]} fi]
+  (let [[a b c] (nth faces fi)]
+    (k/v-normalize (k/v-cross (k/v- (nth vertices b) (nth vertices a))
+                              (k/v- (nth vertices c) (nth vertices a))))))
+
+(defmethod apply-feature :chamfer [feature _ctx acc]
+  ;; A chamfer on a solid with planar faces IS a plane cut — no blend surface is
+  ;; involved. That is exactly why chamfer is reachable here and fillet is not:
+  ;; a fillet needs a rolling-ball surface this kernel has no representation for.
+  ;; Each selected edge contributes one half-space, subtracted through
+  ;; `brep.mesh-csg`, which returns closed solids as of 2026-08-21.
+  (let [{:keys [edges distance]} feature
+        d (double (or distance 0))]
+    (cond
+      (nil? acc)
+      [:error (str "chamfer " (:id feature) " has no body to cut")]
+
+      (not (pos? d))
+      [:error (str "chamfer " (:id feature) " needs a positive :distance (got "
+                   distance ")")]
+
+      ;; The constructor names edges with BREP ids. A mesh accumulator has no
+      ;; such ids, and inventing a mapping would chamfer edges nobody selected.
+      ;; Two selectors are understood, both expressed in terms of the mesh that
+      ;; is actually being cut.
+      (not (or (= :all-convex edges)
+               (and (coll? edges) (seq edges)
+                    (every? #(and (vector? %) (= 2 (count %))) edges))))
+      [:error (str "chamfer " (:id feature) " :edges must be :all-convex or a"
+                   " collection of [i j] mesh edge keys from"
+                   " brep.topology/sharp-edges — BREP edge ids do not exist on"
+                   " the mesh this evaluates, and guessing a mapping would"
+                   " chamfer edges that were not selected (got "
+                   (pr-str edges) ")")]
+
+      :else
+      (let [topo0 (topo/topology acc)
+            selected (if (= :all-convex edges)
+                       (topo/sharp-edges topo0 :convex 0.2)
+                       (vec edges))
+            [lo hi] (topo/mesh-bounds acc)
+            extent (* 4.0 (apply max 1.0 (map - hi lo)))
+            ;; Cut planes are computed ONCE, from the original body. Each cut
+            ;; renumbers vertices, so an edge key read from the result of the
+            ;; previous cut would refer to something else.
+            planes (keep (fn [[i j :as e]]
+                           (when-let [info (get (:edges topo0) e)]
+                             (when (= :manifold (:kind info))
+                               (let [[f1 f2] (:faces info)
+                                     n1 (face-normal-of topo0 f1)
+                                     n2 (face-normal-of topo0 f2)
+                                     pi (nth (:vertices topo0) i)
+                                     pj (nth (:vertices topo0) j)
+                                     along (k/v-normalize (k/v- pj pi))
+                                     ;; in each face, perpendicular to the edge,
+                                     ;; pointing away from the other face
+                                     step (fn [n other]
+                                            (let [c (k/v-normalize (k/v-cross n along))]
+                                              (if (pos? (k/v-dot c other))
+                                                (k/v-scale c -1.0) c)))
+                                     p1 (k/v+ pi (k/v-scale (step n1 n2) d))
+                                     p2 (k/v+ pi (k/v-scale (step n2 n1) d))]
+                                 [(k/v-scale (k/v+ p1 p2) 0.5)
+                                  (k/v-normalize (k/v+ n1 n2))]))))
+                         selected)]
+        (cond
+          (empty? selected)
+          [:error (str "chamfer " (:id feature) " selected no edges")]
+
+          (empty? planes)
+          [:error (str "chamfer " (:id feature) " selected " (count selected)
+                       " edge(s), none of which is a manifold edge of this body")]
+
+          :else
+          ;; The result IS the accumulator — a chamfer modifies the body in
+          ;; place. Routing it through `combine` with `:new` would fall to that
+          ;; function's default of :union and quietly put the removed material
+          ;; back: measured, the volume came out unchanged at 600 and every
+          ;; dihedral was still 90 degrees while the triangle count had grown
+          ;; from 12 to 52. A cut that adds triangles and changes nothing is
+          ;; the most convincing kind of wrong.
+          [:ok (reduce (fn [m [origin normal]]
+                         (csg/mesh-boolean :difference m
+                                           (topo/half-space-box origin normal extent)))
+                       acc planes)])))))
 
 (defn evaluate-mesh
   "Evaluate a feature tree to a **triangle mesh** by folding each feature
