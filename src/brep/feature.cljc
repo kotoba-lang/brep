@@ -869,13 +869,30 @@
         v (step n2 n1)          ; along face 2, away from face 1
         ;; The section is drawn in the (u, v) frame with the sharp corner at
         ;; the origin: out to r along u, arc back to r along v.
-        centre [radius radius]
         arc (mapv (fn [s]
                     (let [t (* (/ s (double segments)) (/ Math/PI 2.0))]
                       [(- radius (* radius (Math/sin t)))
                        (- radius (* radius (Math/cos t)))]))
                   (range (inc segments)))
-        section (into [[0.0 0.0] [radius 0.0]] (conj (vec (rest (butlast arc))) [0.0 radius]))
+        ;; The tool's two flat sides are pushed OUTSIDE the body by `d` instead
+        ;; of lying on its faces.
+        ;;
+        ;; A section that stopped at the faces made the tool's sides exactly
+        ;; coplanar with two faces of the body, and coplanar faces are the
+        ;; degenerate case a BSP boolean handles by choosing a side — which
+        ;; side depending on the order polygons arrive in. That is why the
+        ;; failures were sporadic in the segment count and different on each
+        ;; host: `brep.topology` seeds its region walk with `(first some-set)`,
+        ;; the JVM and ClojureScript iterate a set in different orders, and the
+        ;; order decided which coplanar case the tree met. Moving the sides off
+        ;; the faces removes the degeneracy rather than the disagreement about
+        ;; it, so the only intersection left is the arc, which crosses the
+        ;; faces transversally. The extra material is outside the body and the
+        ;; difference clips it, so the volume removed is unchanged.
+        d (* 0.05 radius)
+        section (vec (concat [[(- d) (- d)] [radius (- d)] [radius 0.0]]
+                             (rest (butlast arc))
+                             [[0.0 radius] [(- d) radius]]))
         origin (k/v+ pi* (k/v-scale along (- overshoot)))]
     (prism-mesh origin u v along (+ (k/v-length (k/v- pj pi*)) (* 2.0 overshoot))
                 section)))
@@ -1072,59 +1089,55 @@
           ;; Tools are computed ONCE from the original body: each subtraction
           ;; renumbers vertices, so an edge key read from the previous result
           ;; would refer to something else.
-          (let [tools (mapv #(fillet-tool topo0 % r segs overshoot) manifold)
-                ;; The BSP recurses per polygon, and a tool with a tessellated
-                ;; arc gives it many nearly-coplanar ones. Measured: filleting
-                ;; all twelve convex edges of a block at 8 segments overflows
-                ;; the stack inside `brep.mesh-csg`. A caller asking for a
-                ;; fillet should get an answer or a refusal, never a
-                ;; StackOverflowError arriving from three namespaces away.
-                result (try
-                         (reduce (fn [m tool] (csg/mesh-boolean :difference m tool)) body tools)
-                         (catch #?(:clj Throwable :cljs :default) _ ::boolean-failed))]
-            (if (= ::boolean-failed result)
-              [:error (str "fillet " (:id feature) " exhausted the boolean solver on "
-                           (count manifold) " edge(s) at " segs " segments. The BSP in"
-                           " brep.mesh-csg recurses per polygon and a tessellated arc"
-                           " gives it many nearly-coplanar ones; fewer edges per"
-                           " feature, or fewer segments, gets through.")]
-              (let [open-edges (count (topo/boundary-edges (topo/topology result)))]
-            ;; The boolean is checked, not trusted. Measured 2026-08-22 on a
-            ;; 10x10x6 block filleted at r=1: segments 2, 4, 8, 16, 20, 24, 32,
-            ;; 40 and 48 all return a closed solid whose removed volume
-            ;; converges on L r^2 (1 - pi/4) at second order — while 12 and 64
-            ;; come back with 8 and 14 boundary edges and a volume that is
-            ;; WRONG IN THE OTHER DIRECTION. The failure is sporadic in the
-            ;; segment count, so it is the BSP meeting near-degenerate facets
-            ;; rather than anything about the tool; until that is fixed, an
-            ;; open result has to be reported rather than returned. A caller
-            ;; who only checks for :ok would otherwise machine it.
-            ;;
-            ;; It is also HOST-DEPENDENT, which is worse and is why this is
-            ;; not merely a tolerance to tune. The same fillet on the same
-            ;; block, measured 2026-08-22: the JVM succeeds at 4, 8, 16, 20,
-            ;; 24, 32 and 48 segments and fails at 12 and 64; nbb fails at 4,
-            ;; 8, 16 and 20 and succeeds at 12, 24, 32, 48 and 64. Sweeping
-            ;; the CSG epsilon over 1e-7, 1e-6 and 1e-5 changed NOTHING on
-            ;; either host, so it is not precision. `brep.topology` seeds its
-            ;; region walk with `(first some-set)`, and Clojure and
-            ;; ClojureScript iterate a set in different orders — that seed
-            ;; decides the region order, which decides the polygon order,
-            ;; which decides the BSP root plane. Replacing it with the lowest
-            ;; index makes the two hosts agree, and makes them agree on
-            ;; FAILING everywhere, so the ordering was load-bearing by
-            ;; accident and the real fix is in the boolean, not the seed.
-            ;; That change is not made here: it broke 10 existing assertions,
-            ;; and shipping a kernel that is consistently wrong in exchange
-            ;; for being consistent is not a trade this makes quietly.
-                (if (pos? open-edges)
-                  [:error (str "fillet " (:id feature) " produced a surface with "
-                               open-edges " boundary edge(s) — the boolean failed on"
-                               " this combination of radius " r " and " segs
-                               " segments. Try a different :segments; the failure is"
-                               " sporadic in that number, not monotone, so a nearby"
-                               " value usually works.")]
-                  [:ok result])))))))))
+          ;;
+          ;; The boolean is RETRIED over the tool's overshoot, and the reason
+          ;; that is sound rather than answer-shopping is that the overshoot
+          ;; is the one parameter of the tool that cannot change the result:
+          ;; it extends the tool along the edge, entirely OUTSIDE the body, so
+          ;; the difference clips every bit of it. Measured on a 10x10x6 block
+          ;; filleted at r=1 with 12 segments, every overshoot that produced a
+          ;; closed solid produced the same removed volume to nine decimal
+          ;; places — 2.168428467 at 0.02, 0.05, 0.06 and 0.37 — while 0.1,
+          ;; 0.13 and 0.2 came back with 6 boundary edges. The failures are a
+          ;; degeneracy in `brep.mesh-csg`, not a disagreement about the shape,
+          ;; and perturbing a parameter the shape does not depend on is the
+          ;; cheapest way past one until the boolean itself is fixed.
+          ;;
+          ;; Four attempts at fixing `brep.mesh-csg` directly are recorded so
+          ;; they are not retried. Widening its epsilon over 1e-7, 1e-6 and
+          ;; 1e-5 changed nothing on either host. Clamping the split parameter
+          ;; to [0,1] and keeping sub-triangle fragments instead of dropping
+          ;; them changed nothing — both were written, measured, found not to
+          ;; be load-bearing, and REVERTED rather than left in a fragile
+          ;; component as unverified behaviour. Seeding `brep.topology`'s
+          ;; region walk deterministically made the two hosts agree and agree
+          ;; on failing everywhere, breaking ten assertions.
+          ;;
+          ;; What did work is here and in the tool: keeping the tool off the
+          ;; body's face planes, and retrying the overshoot. Together they take
+          ;; a single edge from failing at 2 of 9 segment counts on the JVM and
+          ;; 4 of 9 under nbb — different ones — to 9 of 9 on both.
+          (let [span (apply max 1.0 (map - hi lo))
+                attempts (mapv #(* % span) [0.011 0.002 0.005 0.023 0.037 0.047 0.091 0.29])
+                try-one (fn [ov]
+                          (let [tools (mapv #(fillet-tool topo0 % r segs ov) manifold)]
+                            (try
+                              (let [m (reduce (fn [m tool]
+                                                (csg/mesh-boolean :difference m tool))
+                                              body tools)]
+                                (when (empty? (topo/boundary-edges (topo/topology m))) m))
+                              (catch #?(:clj Throwable :cljs :default) _ nil))))
+                result (some try-one attempts)]
+            (if result
+              [:ok result]
+              [:error (str "fillet " (:id feature) " could not be cut: the boolean in"
+                           " brep.mesh-csg returned an open surface or exhausted"
+                           " itself for all " (count attempts) " tool overshoots tried,"
+                           " on " (count manifold) " edge(s) at " segs " segments."
+                           " An open result is a surface whose volume is wrong, so it"
+                           " is not returned. A different :segments usually gets"
+                           " through — the failure is a degeneracy in the boolean,"
+                           " sporadic in that number rather than monotone.")])))))))
 
 (defn evaluate-mesh
   "Evaluate a feature tree to a **triangle mesh** by folding each feature
