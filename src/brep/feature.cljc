@@ -1099,6 +1099,24 @@
             ;; rather than anything about the tool; until that is fixed, an
             ;; open result has to be reported rather than returned. A caller
             ;; who only checks for :ok would otherwise machine it.
+            ;;
+            ;; It is also HOST-DEPENDENT, which is worse and is why this is
+            ;; not merely a tolerance to tune. The same fillet on the same
+            ;; block, measured 2026-08-22: the JVM succeeds at 4, 8, 16, 20,
+            ;; 24, 32 and 48 segments and fails at 12 and 64; nbb fails at 4,
+            ;; 8, 16 and 20 and succeeds at 12, 24, 32, 48 and 64. Sweeping
+            ;; the CSG epsilon over 1e-7, 1e-6 and 1e-5 changed NOTHING on
+            ;; either host, so it is not precision. `brep.topology` seeds its
+            ;; region walk with `(first some-set)`, and Clojure and
+            ;; ClojureScript iterate a set in different orders — that seed
+            ;; decides the region order, which decides the polygon order,
+            ;; which decides the BSP root plane. Replacing it with the lowest
+            ;; index makes the two hosts agree, and makes them agree on
+            ;; FAILING everywhere, so the ordering was load-bearing by
+            ;; accident and the real fix is in the boolean, not the seed.
+            ;; That change is not made here: it broke 10 existing assertions,
+            ;; and shipping a kernel that is consistently wrong in exchange
+            ;; for being consistent is not a trade this makes quietly.
                 (if (pos? open-edges)
                   [:error (str "fillet " (:id feature) " produced a surface with "
                                open-edges " boundary edge(s) — the boolean failed on"
