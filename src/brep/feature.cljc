@@ -197,6 +197,45 @@
                (recur (conj ring cur) nxt (disj remaining i)))
              nil)))))))
 
+(defn sketch->polyline
+  "Chain a sketch's straight segments into one ordered OPEN polyline of 2D
+  points, or nil when they do not form exactly one open chain.
+
+  `sketch->ring` above answers the closed question; a sweep path is normally
+  open, and the two cannot share a walk: the ring walk starts anywhere because
+  a loop has no ends, while an open chain has to start at one of its two
+  endpoints or it walks off the near end and reports a break that is not there.
+
+  Returns nil (never a guess) when: fewer than one segment, any point has three
+  or more segments meeting at it (a branch — which branch is the path is a
+  decision, not a default), the chain closes (that is a ring, ask the other
+  function), or segments are left over (more than one chain). Circles, arcs and
+  splines are not chained here."
+  [sketch]
+  (let [segs (vec (filter #(= :line (:kind %)) (:entities sketch)))]
+    (when (>= (count segs) 1)
+      (let [pts (mapcat (juxt :start :end) segs)
+            degree (reduce (fn [m p]
+                             (let [k (first (filter #(pt2= p %) (keys m)))]
+                               (if k (update m k inc) (assoc m p 1))))
+                           {} pts)
+            ends (keep (fn [[p n]] (when (= 1 n) p)) degree)]
+        (when (and (= 2 (count ends))
+                   (every? #(<= (val %) 2) degree))
+          (loop [chain [(first ends)]
+                 cur (first ends)
+                 remaining (set (range (count segs)))]
+            (if (empty? remaining)
+              (when (= (inc (count segs)) (count chain)) chain)
+              (if-let [i (first (filter (fn [i]
+                                          (let [sg (nth segs i)]
+                                            (or (pt2= cur (:start sg)) (pt2= cur (:end sg)))))
+                                        remaining))]
+                (let [sg (nth segs i)
+                      nxt (if (pt2= cur (:start sg)) (:end sg) (:start sg))]
+                  (recur (conj chain nxt) nxt (disj remaining i)))
+                nil))))))))
+
 (defn- to-3d
   "Lift a 2D sketch point onto the sketch plane."
   [plane [u v]]
@@ -211,6 +250,63 @@
                   e1 (k/v-normalize (k/v-cross n a))
                   e2 (k/v-cross n e1)]
               (k/v+ o (k/v+ (k/v-scale e1 (double u)) (k/v-scale e2 (double v)))))))
+
+(defn- plane-basis
+  "`[origin e1 e2 normal]` for a sketch plane, matching `to-3d` exactly: a 2D
+  point `[u v]` lifts to `origin + u*e1 + v*e2`. Kept next to `to-3d` because
+  the two must agree — a sweep places the profile with this basis and would
+  otherwise sweep a different shape than the one that was drawn."
+  [plane]
+  (case (:kind plane)
+    :xy [[0.0 0.0 0.0] [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]]
+    :xz [[0.0 0.0 0.0] [1.0 0.0 0.0] [0.0 0.0 1.0] [0.0 1.0 0.0]]
+    :yz [[0.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [1.0 0.0 0.0]]
+    :custom (let [n (k/v-normalize (:normal plane))
+                  a (if (< (Math/abs (nth n 0)) 0.9) [1.0 0.0 0.0] [0.0 1.0 0.0])
+                  e1 (k/v-normalize (k/v-cross n a))
+                  e2 (k/v-cross n e1)]
+              [(:origin plane) e1 e2 n])))
+
+(defn- rotate-about
+  "Rodrigues rotation of `x` about unit `axis` by `angle`."
+  [x axis angle]
+  (let [c (Math/cos angle) s (Math/sin angle)]
+    (k/v+ (k/v+ (k/v-scale x c)
+                (k/v-scale (k/v-cross axis x) s))
+          (k/v-scale axis (* (k/v-dot axis x) (- 1.0 c))))))
+
+(defn- transport-frame
+  "Rotate `[e1 e2]` by the minimal rotation carrying `t0` onto `t1`.
+
+  This is what makes a swept profile keep its orientation around a corner. A
+  sweep that only TRANSLATES the profile is right on a straight path and
+  silently wrong the moment the path turns — the section stops being
+  perpendicular to the path and the solid pinches. Returns nil for a 180°
+  reversal, where the minimal rotation is not unique."
+  [t0 t1 [e1 e2]]
+  (let [axis (k/v-cross t0 t1)
+        len (k/v-length axis)
+        d (k/v-dot t0 t1)]
+    (cond
+      (and (< len 1.0e-12) (pos? d)) [e1 e2]        ; same direction, nothing to do
+      (< len 1.0e-12) nil                            ; reversal: ambiguous
+      :else (let [a (k/v-scale axis (/ 1.0 len))
+                  angle (Math/atan2 len d)]
+              [(rotate-about e1 a angle) (rotate-about e2 a angle)]))))
+
+(defn- path-tangents
+  "Unit tangent at each station of a polyline. Interior stations average the
+  incoming and outgoing directions so the section splits the corner, which is
+  what keeps a mitred corner from self-intersecting on the inside."
+  [pts]
+  (let [n (count pts)
+        seg (fn [i] (k/v-normalize (k/v- (nth pts (inc i)) (nth pts i))))]
+    (mapv (fn [i]
+            (cond
+              (zero? i) (seg 0)
+              (= i (dec n)) (seg (- n 2))
+              :else (k/v-normalize (k/v+ (seg (dec i)) (seg i)))))
+          (range n))))
 
 (defn- newell-normal
   "Face normal from its own vertex loop (Newell's method) — robust to the
@@ -454,6 +550,83 @@
                (solid->mesh (extrude-prism 1 ring (:plane sk)
                                            (:direction feature) (:distance feature)))
                (:operation feature)))))
+
+(defn- cap-mesh
+  "Triangulate `ring2d` in its own 2D plane and place the result with `place`
+  (a 2D point -> 3D point). `flip?` reverses the winding for the far cap.
+  Triangulating in 2D via `brep.polygon` is what makes concave profiles work —
+  a fan from vertex 0 would cut outside the profile."
+  [ring2d place flip? offset]
+  (let [{:keys [vertices indices]} (poly/triangulate-rings [ring2d])
+        idx (mapv #(+ offset %) indices)]
+    [(mapv place vertices)
+     (if flip? (vec (mapcat (fn [[a b c]] [a c b]) (partition 3 idx))) (vec idx))]))
+
+(defmethod apply-feature :sweep [feature {:keys [sketches]} acc]
+  (let [profile (get sketches (:profile-ref feature))
+        path-sk (get sketches (:path-ref feature))
+        ring (when profile (sketch->ring profile))
+        path2d (when path-sk (sketch->polyline path-sk))
+        path (when path2d (mapv #(to-3d (:plane path-sk) %) path2d))
+        [_ pe1 pe2 pn] (when profile (plane-basis (:plane profile)))
+        tangents (when (and path (>= (count path) 2)) (path-tangents path))]
+    (cond
+      (nil? ring)
+      [:error (str "sweep " (:id feature) " needs :profile-ref to name a sketch that"
+                   " is a single closed loop of straight segments")]
+
+      (nil? path2d)
+      [:error (str "sweep " (:id feature) " needs :path-ref to name a sketch that is a"
+                   " single OPEN chain of straight segments (a closed path, a branch, or"
+                   " leftover segments are all refused — which chain is the path would"
+                   " otherwise be a guess)")]
+
+      ;; The profile is placed with its OWN plane basis, so what is swept is what
+      ;; was drawn. That only makes sense if the profile faces along the path at
+      ;; the start; otherwise the first section is oblique and every downstream
+      ;; frame inherits the error. Refuse instead of quietly reinterpreting the
+      ;; profile in a frame it was not drawn in.
+      (< (Math/abs (k/v-dot pn (first tangents))) (- 1.0 1.0e-6))
+      [:error (str "sweep " (:id feature) " needs the profile plane to be perpendicular"
+                   " to the start of the path: profile normal " (pr-str (mapv double pn))
+                   " vs initial tangent " (pr-str (mapv double (first tangents))))]
+
+      :else
+      (let [t0 (first tangents)
+            ;; face the profile basis down the path
+            [e1 e2] (if (neg? (k/v-dot pn t0)) [pe2 pe1] [pe1 pe2])
+            frames (reductions (fn [[f prev-t] t]
+                                 (when f [(transport-frame prev-t t f) t]))
+                               [[e1 e2] t0]
+                               (rest tangents))]
+        (if (some (fn [fr] (or (nil? fr) (nil? (first fr)))) frames)
+          [:error (str "sweep " (:id feature) " has a 180° reversal in its path;"
+                       " the minimal rotation carrying the section across it is not"
+                       " unique, so no section is chosen")]
+          (let [place (fn [origin [u v] [f1 f2]]
+                        (k/v+ origin (k/v+ (k/v-scale f1 (double u)) (k/v-scale f2 (double v)))))
+                stations (mapv (fn [p [f _]] [p f]) path frames)
+                n (count ring)
+                positions (vec (mapcat (fn [[p f]] (mapv #(place p % f) ring)) stations))
+                sides (vec (mapcat
+                            (fn [si]
+                              (mapcat (fn [j]
+                                        (let [j2 (mod (inc j) n)
+                                              a (+ (* si n) j) b (+ (* si n) j2)
+                                              c (+ (* (inc si) n) j2) d (+ (* (inc si) n) j)]
+                                          [a b c a c d]))
+                                      (range n)))
+                            (range (dec (count stations)))))
+                [p0 f0] (first stations)
+                [pl fl] (last stations)
+                [start-pts start-idx] (cap-mesh ring #(place p0 % f0) true (count positions))
+                positions (into positions start-pts)
+                [end-pts end-idx] (cap-mesh ring #(place pl % fl) false (count positions))
+                positions (into positions end-pts)]
+            (combine acc
+                     {:positions positions
+                      :indices (vec (concat sides start-idx end-idx))}
+                     (:operation feature))))))))
 
 (defmethod apply-feature :pattern [feature {:keys [entries]} acc]
   (let [{:keys [source-features direction count spacing]} feature
