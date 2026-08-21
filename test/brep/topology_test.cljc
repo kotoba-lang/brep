@@ -1,6 +1,7 @@
 (ns brep.topology-test
   (:require [clojure.test :refer [deftest is testing]]
             [brep.topology :as topo]
+            [brep.mesh-csg :as csg]
             [brep.feature :as f]))
 
 (defn- square [id plane x0 y0 x1 y1]
@@ -72,33 +73,66 @@
       (is (every? #(and (nil? (:dihedral %)) (nil? (:convexity %)))
                   (vals (:edges t)))))))
 
-(deftest mesh-booleans-do-not-return-closed-solids
-  ;; Measured 2026-08-21. `brep.mesh-csg/mesh-boolean` renders, and its triangle
-  ;; count changes as expected, but the result is not watertight in ANY case
-  ;; tried — including a union of two boxes that do not touch, where there is
-  ;; nothing to intersect. Pinned here so the day it is fixed, this test says so.
+(defn- box-mesh-at [x0 y0 x1 y1 z h]
+  (let [m (second (f/evaluate-mesh
+                   (-> (f/feature-tree)
+                       (f/add-feature (square 1 (f/sketch-plane-xy) x0 y0 x1 y1))
+                       (f/add-feature (f/extrude-feature 2 1 [0 0 1] h :new)))))]
+    (update m :positions (fn [ps] (mapv (fn [[x y zz]] [x y (+ zz z)]) ps)))))
+
+(defn- closure [op a b]
+  (let [t (topo/topology (csg/mesh-boolean op a b))]
+    {:euler (topo/euler-characteristic t)
+     :boundary (count (topo/boundary-edges t))
+     :closed? (and (:manifold? t) (empty? (topo/boundary-edges t)))}))
+
+(deftest booleans-close-when-nothing-is-cut
+  ;; `mesh-boolean` now welds and re-winds its inputs. It has to: a BSP boolean
+  ;; reads front/back off each polygon's own normal, and `tessellate-solid`
+  ;; emits faces independently with no guarantee of consistent winding, so every
+  ;; caller arriving from a feature tree was handing it exactly that.
   ;;
-  ;; Stable across weld tolerances from 1e-9 to 1e-2, so this is real geometry,
-  ;; not a welding artifact.
-  (let [run (fn [tree] (topo/topology (second (f/evaluate-mesh tree))))
-        base (-> (f/feature-tree)
-                 (f/add-feature (square 1 (f/sketch-plane-xy) 0 0 10 10))
-                 (f/add-feature (f/extrude-feature 2 1 [0 0 1] 4 :new)))]
-    (testing "the extrusion it starts from IS closed, so the pipeline is not at fault"
-      (is (:manifold? (run base))))
+  ;; The sharpest case is the first one: two boxes standing 20 apart, nothing to
+  ;; intersect, and before this the union came back with 4 boundary edges.
+  (let [big (box-mesh-at 0 0 10 10 0 4)]
+    (testing "a union of two boxes that never meet is two closed shells"
+      (let [r (closure :union big (box-mesh-at 20 20 24 24 0 4))]
+        (is (:closed? r))
+        (is (= 4 (:euler r)))))
 
-    (testing "a corner cut leaves the mesh open"
-      (let [t (run (-> base
-                       (f/add-feature (square 3 (f/sketch-plane-xy) 5 5 12 12))
-                       (f/add-feature (f/extrude-feature 4 3 [0 0 1] 9 :cut))))]
-        (is (not (:manifold? t)))
-        (is (pos? (count (topo/boundary-edges t))))))
+    (testing "a union of two boxes sharing a face is one closed solid"
+      (is (:closed? (closure :union big (box-mesh-at 10 0 20 10 0 4)))))
 
-    (testing "so does a union of two boxes that never meet"
-      (let [t (run (-> (f/feature-tree)
-                       (f/add-feature (square 1 (f/sketch-plane-xy) 0 0 4 4))
-                       (f/add-feature (f/extrude-feature 2 1 [0 0 1] 2 :new))
-                       (f/add-feature (square 3 (f/sketch-plane-xy) 20 20 24 24))
-                       (f/add-feature (f/extrude-feature 4 3 [0 0 1] 2 :add))))]
-        (is (not (:manifold? t)))
-        (is (pos? (count (topo/boundary-edges t))))))))
+    (testing "a difference by a body that misses entirely leaves the original closed"
+      (is (:closed? (closure :difference big (box-mesh-at 20 20 24 24 0 4)))))
+
+    (testing "an intersection of two overlapping boxes is closed"
+      (is (:closed? (closure :intersection big (box-mesh-at 5 5 15 15 0 4)))))))
+
+(deftest booleans-that-actually-cut-are-still-open
+  ;; Pinned, not accepted. Measured 2026-08-21 AFTER the winding fix: the cases
+  ;; where the two bodies genuinely cut each other still leak. Part of the damage
+  ;; is T-junctions (a vertex sitting in the middle of a neighbouring triangle's
+  ;; edge — geometrically closed, topologically cracked) and the larger part is
+  ;; polygons that are simply gone:
+  ;;
+  ;;   union, overlapping    18 boundary edges   6 T-junctions, 12 holes
+  ;;   difference, hole      28 boundary edges   8 T-junctions, 20 holes
+  ;;   difference, notch     14 boundary edges   6 T-junctions,  8 holes
+  ;;
+  ;; The csg.js transcription has been checked against the original step by step
+  ;; and matches. The leading suspect is that this code is fed TRIANGLES where
+  ;; csg.js is fed quads, so each planar face arrives pre-split and its fragments
+  ;; fall below the three-vertex floor in `split-polygon`.
+  ;;
+  ;; These assertions say "still broken" on purpose. The day the CSG is fixed
+  ;; they fail, and that failure is the notification.
+  (let [big (box-mesh-at 0 0 10 10 0 4)]
+    (testing "overlapping union leaks"
+      (is (not (:closed? (closure :union big (box-mesh-at 5 5 15 15 0 4))))))
+    (testing "a through hole leaks"
+      (is (not (:closed? (closure :difference big (box-mesh-at 3 3 7 7 -1 6))))))
+    (testing "a corner notch leaks"
+      (is (not (:closed? (closure :difference big (box-mesh-at 8 8 12 12 -1 6))))))
+    (testing "and the extrusion they all start from is closed, so the pipeline is not at fault"
+      (is (:manifold? (topo/topology (box-mesh-at 0 0 10 10 0 4)))))))
