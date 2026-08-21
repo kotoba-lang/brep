@@ -99,7 +99,7 @@
       (is (= :ok st))
       (is (= 6 (k/face-count solid)) "a 4-gon prism has 4 sides + 2 caps")
       (is (= 12 (k/edge-count solid)))
-      (is (= 8 (k/vertex-count solid edges verts)))
+      (is (= 8 (k/vertex-count solid edges)))   ; takes solid + edges; the third arg was an arity error, not a shape claim
       (is (= [[0.0 0.0 0.0] [w h d]]
              (mapv #(mapv double %) (k/bounding-box solid edges verts))))
       (is (< (Math/abs (- (tess/volume solid edges verts) (* w h d))) 1e-6)
@@ -491,3 +491,76 @@
            (second (f/evaluate-mesh (-> (f/feature-tree)
                                         (f/add-feature (f/chamfer-feature 3 :all-convex 1.0)))))
            "no body to cut")))))
+
+(deftest shell-hollows-a-body-to-the-analytic-volume
+  ;; A shell is an inward offset and a difference, so the material it LEAVES is
+  ;; a closed form: for a 10-cube at thickness 1, 1000 - 8^3 = 488. Volume is
+  ;; the measurement that matters here, because the failure mode of this
+  ;; construction is a perfectly closed solid of the wrong size — see the
+  ;; too-thick case below, where the offset planes cross and the "shell" comes
+  ;; back at 990 of 1000, closed, Euler 2, indistinguishable from the block.
+  (let [[_ block] (f/evaluate-mesh (block-tree))   ; 10 x 10 x 6 = 600
+        closed (f/evaluate-mesh (f/add-feature (block-tree) (f/shell-feature 3 nil 1.0)))
+        opened (f/evaluate-mesh (f/add-feature (block-tree) (f/shell-feature 3 [[0 0 1]] 1.0)))]
+    (is (= 600.0 (double (mesh-volume block))))
+
+    (testing "closed on every side: a 8 x 8 x 4 void"
+      (let [[status m] closed t (topo/topology m)]
+        (is (= :ok status))
+        (is (< (Math/abs (- (mesh-volume m) (- 600.0 (* 8.0 8.0 4.0)))) 1.0e-9))
+        (is (empty? (topo/boundary-edges t)))
+        ;; two shells — an outer surface and the surface of the void inside it
+        (is (= 4 (topo/euler-characteristic t)))))
+
+    (testing "open at +Z: the void runs out through the top, so one shell"
+      (let [[status m] opened t (topo/topology m)]
+        (is (= :ok status))
+        (is (< (Math/abs (- (mesh-volume m) (- 600.0 (* 8.0 8.0 5.0)))) 1.0e-9))
+        (is (empty? (topo/boundary-edges t)))
+        (is (= 2 (topo/euler-characteristic t)))))
+
+    (testing "the same construction on a body that is not a box"
+      ;; right isoceles legs 10, height 6. Inradius (10+10-sqrt(200))/2, and the
+      ;; inward offset is the similar triangle at inradius - 1.
+      (let [prism (-> (f/feature-tree)
+                      (f/add-feature (f/sketch-feature 1 (f/sketch-plane-xy)
+                                                       [(f/sketch-line [0 0] [10 0])
+                                                        (f/sketch-line [10 0] [0 10])
+                                                        (f/sketch-line [0 10] [0 0])]))
+                      (f/add-feature (f/extrude-feature 2 1 [0 0 1] 6 :new)))
+            r (/ (- 20.0 (Math/sqrt 200.0)) 2.0)
+            inner (* 50.0 (Math/pow (/ (- r 1.0) r) 2) 4.0)
+            [status m] (f/evaluate-mesh (f/add-feature prism (f/shell-feature 3 nil 1.0)))]
+        (is (= :ok status))
+        (is (< (Math/abs (- (mesh-volume m) (- 300.0 inner))) 1.0e-6))))))
+
+(deftest shell-refuses-what-it-cannot-offset
+  (testing "a thickness the body cannot hold is rejected, not silently ignored"
+    (let [[status msg] (f/evaluate-mesh (f/add-feature (block-tree) (f/shell-feature 3 nil 9.0)))]
+      (is (= :error status))
+      (is (string/includes? msg "offset walls cross"))))
+
+  (testing "a concave body is refused, naming the representation that is missing"
+    ;; The block with a corner notched out. The plane-intersection offset is
+    ;; wrong at a reflex edge and wrong in a way that still returns a closed
+    ;; solid, so refusing is the only honest answer this kernel can give.
+    (let [notched (-> (block-tree)
+                      (f/add-feature (f/sketch-feature 3 (f/sketch-plane-xy)
+                                                       [(f/sketch-line [6 6] [12 6])
+                                                        (f/sketch-line [12 6] [12 12])
+                                                        (f/sketch-line [12 12] [6 12])
+                                                        (f/sketch-line [6 12] [6 6])]))
+                      (f/add-feature (f/extrude-feature 4 3 [0 0 1] 6 :cut)))
+          [status msg] (f/evaluate-mesh (f/add-feature notched (f/shell-feature 5 nil 1.0)))]
+      (is (= :error status))
+      (is (string/includes? msg "concave"))
+      (is (string/includes? msg "offset-surface"))))
+
+  (testing "a direction that names no face is refused with the normals it has"
+    (let [[status msg] (f/evaluate-mesh
+                        (f/add-feature (block-tree) (f/shell-feature 3 [[1 1 1]] 1.0)))]
+      (is (= :error status))
+      (is (string/includes? msg ":removed-faces named"))))
+
+  (testing "shell is registered, so the registry answers for it"
+    (is (contains? (f/supported-feature-kinds) :shell))))
