@@ -1,5 +1,6 @@
 (ns brep.mesh-csg
-  "Portable BSP-based boolean operations for closed triangle meshes.")
+  "Portable BSP-based boolean operations for closed triangle meshes."
+  (:require [brep.topology :as topo]))
 
 (def ^:private epsilon 1.0e-7)
 (def ^:private coplanar 0)
@@ -141,11 +142,46 @@
      :indices (vec (range (count vertices)))}))
 
 (defn mesh-boolean
-  "Apply `:union`, `:difference`, or `:intersection` to two closed,
-  consistently wound triangle meshes."
+  "Apply `:union`, `:difference`, or `:intersection` to two closed triangle
+  meshes.
+
+  **The inputs are welded and re-wound before use.** A BSP boolean classifies
+  every polygon as front or back of a plane, and that classification is read off
+  the polygon's own normal — so a mesh whose faces are not wound consistently
+  feeds the tree normals that point in directions unrelated to the shape.
+  `brep.tessellate/tessellate-solid` emits each face independently and does NOT
+  guarantee consistent winding, so every caller coming from a feature tree was
+  handing this function exactly that. Measured 2026-08-21: a union of two boxes
+  standing 20 apart — nothing to intersect at all — came back with 4 boundary
+  edges. Welding and orienting first makes that case, and a union of two boxes
+  sharing a face, come back closed.
+
+  ⚠ **The result is still not watertight in every case.** Booleans whose
+  operands actually cut each other leak, measured as of 2026-08-21:
+
+      union, disjoint / touching        closed
+      union, overlapping                18 boundary edges (6 T-junctions, 12 holes)
+      difference, no overlap            closed
+      difference, through hole          28 boundary edges (8 T-junctions, 20 holes)
+      difference, corner notch          14 boundary edges (6 T-junctions, 8 holes)
+      intersection, overlapping         closed
+
+  So part of the damage is T-junctions — vertices sitting in the middle of a
+  neighbouring triangle's edge, where the surface is geometrically closed but
+  topologically cracked — and the larger part is polygons that are simply gone.
+  The transcription of the csg.js algorithm here has been checked against the
+  original step by step and matches it; the leading suspect is that this
+  function is fed TRIANGLES where csg.js is fed quads, so each planar face
+  arrives already split and its fragments fall below the three-vertex floor in
+  `split-polygon`. Feeding it coplanar-merged polygons is the next thing to try.
+  `brep.topology` is what can both merge them and check the answer.
+
+  Until then: check the result with `brep.topology/topology` before relying on
+  it being a solid. Volume, STEP export, machining stock and printing all
+  depend on closure, and this does not yet provide it in the cutting cases."
   [operation mesh-a mesh-b]
-  (let [a (build-node (mesh->polygons mesh-a))
-        b (build-node (mesh->polygons mesh-b))
+  (let [a (build-node (mesh->polygons (topo/welded-oriented mesh-a)))
+        b (build-node (mesh->polygons (topo/welded-oriented mesh-b)))
         result
         (case operation
           :union (let [a1 (clip-to a b)

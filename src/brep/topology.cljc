@@ -242,3 +242,14 @@
   "Edges with a single adjacent face — the mesh has a hole there."
   [topo]
   (edges-where topo #(= :boundary (:kind %))))
+
+(defn welded-oriented
+  "`mesh` with coincident positions merged and every face wound consistently
+  (outward for a closed mesh). The shape any algorithm that reads face normals
+  needs its input in — `brep.mesh-csg` says so in its own docstring and had no
+  way to get it until this namespace existed."
+  [mesh]
+  (let [{:keys [positions indices]} (weld-mesh mesh)
+        faces (vec (map vec (partition 3 indices)))
+        [oriented _] (if (seq faces) (orient-faces positions faces) [faces true])]
+    {:positions positions :indices (vec (mapcat identity oriented))}))
