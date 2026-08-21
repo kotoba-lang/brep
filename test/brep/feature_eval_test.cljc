@@ -677,20 +677,39 @@
       ;; radius/segment pairs return an OPEN surface. Both are reported.
       (let [[status msg] (run {:kind :fillet :id 3 :edges :all-convex :radius 0.5 :segments 8})]
         (is (= :error status))
-        (is (or (string/includes? msg "exhausted the boolean solver")
-                (string/includes? msg "boundary edge")))))
+        (is (string/includes? msg "could not be cut"))
+        (is (string/includes? msg "overshoots tried"))))
 
     (testing "a combination the boolean gets wrong is refused, not returned"
-      ;; Two parallel edges at 16 segments comes back with 6 boundary edges —
-      ;; a surface, not a solid, and one whose volume is wrong. Removing the
-      ;; closure check left every other assertion in this file green, so this
-      ;; pins the known-bad pair. The failure is sporadic in the segment count
-      ;; (4, 6, 8, 10, 20, 24 and 32 all work for this same pair), which is
-      ;; why it is the BOOLEAN that is suspect and not the tool.
+      ;; Two parallel edges at 16 segments defeats all eight tool overshoots.
+      ;; A single edge at any segment count no longer does — see the sweep
+      ;; below — so the retry is not a blanket fix and this pins what is left
+      ;; of the failure. It is still a surface with boundary edges underneath,
+      ;; which is a volume that is wrong, so it is refused rather than
+      ;; returned. Removing the closure check leaves every other assertion in
+      ;; this file green, which is why this one exists.
       (let [e2 (edge-at m0 (fn [p] (and (= 10.0 (double (p 1))) (= 6.0 (double (p 2))))))
             [status msg] (run {:kind :fillet :id 3 :edges [e e2] :radius 0.5 :segments 16})]
         (is (= :error status))
-        (is (string/includes? msg "boundary edge"))))
+        (is (string/includes? msg "could not be cut"))))
 
     (testing "fillet is registered, so the registry answers for it"
       (is (contains? (f/supported-feature-kinds) :fillet)))))
+
+(deftest one-edge-rounds-at-every-segment-count-tried
+  ;; Before the overshoot retry this swept 9 values and failed at 2 of them on
+  ;; the JVM and 4 under nbb — DIFFERENT ones, which is what said the boolean
+  ;; and not the geometry was at fault. Both hosts run this file.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        exact (* 10.0 1.0 1.0 (- 1.0 (/ Math/PI 4.0)))]
+    (doseq [segs [4 8 12 16 20 24 32 48 64]]
+      (let [[status m] (f/evaluate-mesh (f/add-feature base {:kind :fillet :id 3 :edges [e]
+                                                             :radius 1.0 :segments segs}))]
+        (is (= :ok status) (str segs " segments: " (pr-str m)))
+        (when (= :ok status)
+          (is (empty? (topo/boundary-edges (topo/topology m))) (str segs " segments"))
+          (is (pos? (- (- 600.0 (mesh-volume m)) exact))
+              (str segs " segments removed less than the exact lune, which an"
+                   " inscribed arc cannot do")))))))
