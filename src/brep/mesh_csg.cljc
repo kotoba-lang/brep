@@ -198,32 +198,33 @@
   the three-vertex floor in `split-polygon`. `brep.topology/merge-coplanar` puts
   the faces back together first.
 
-  ⚠ **The result is still not watertight when the operands cut each other.**
-  Measured 2026-08-21, before and after the merge:
+  The output is then **T-junction repaired**. A BSP splits one side of a cut at
+  the intersection points and can leave the other side as a single span, which
+  is a surface that is geometrically complete — total area exactly the analytic
+  value — while every one of those long edges belongs to a single face and reads
+  as a hole. Measured on a 10x10x4 block with a 4x4 through hole: area 392.000
+  against an analytic 392, and 20 boundary edges. `brep.topology/repair-t-junctions`
+  inserts the vertices that sit on those spans and re-triangulates.
 
-                                    before merge            after merge
-      union, disjoint / touching    closed                  closed
-      union, overlapping            18 bd (6 T, 12 holes)   20 bd (8 T, 12 holes)
-      difference, no overlap        closed                  closed
-      difference, through hole      28 bd (8 T, 20 holes)   20 bd (6 T, 14 holes)
-      difference, corner notch      14 bd (6 T,  8 holes)    6 bd (2 T,  4 holes)
-      intersection, overlapping     closed (16 tris)        closed (12 tris)
+  Measured 2026-08-21, after welding + orientation + coplanar merge + repair:
 
-  So the merge helps — the notch dropped from 14 boundary edges to 6 — but does
-  not close the cutting cases. The remainder is still mostly polygons that are
-  simply gone rather than T-junctions, so the next suspect is inside the BSP
-  clip/build itself rather than the shape of its input.
+      union, disjoint               closed, euler 4 (two shells)
+      union, touching               closed, euler 2
+      union, overlapping            closed, euler 2   (was 20 boundary edges)
+      difference, no overlap        closed, euler 2
+      difference, through hole      closed, euler 0   (genus 1 — a block with a hole)
+      difference, corner notch      closed, euler 2   (was 6)
+      intersection, overlapping     closed, euler 2
 
-  Two things ruled OUT along the way, recorded so they are not re-tried:
-  the csg.js transcription (checked against the original step by step: union,
-  subtract, intersect, clipPolygons, clipTo, invert, build all match), and the
-  fan triangulation of the output (replacing it with `brep.polygon`'s ear
-  clipper changed none of the numbers above — the output polygons in these
-  cases are already convex).
+  Three suspects were ruled out before the real one was found, recorded so they
+  are not re-tried: the csg.js transcription (checked step by step against the
+  original — union, subtract, intersect, clipPolygons, clipTo, invert and build
+  all match), the fan triangulation of the output (replacing it with an ear
+  clipper changed no number), and missing polygons (the area measurement above
+  falsified that outright — nothing was ever lost).
 
-  Until then: check the result with `brep.topology/topology` before relying on
-  it being a solid. Volume, STEP export, machining stock and printing all
-  depend on closure, and this does not yet provide it in the cutting cases."
+  Check the result with `brep.topology/topology` if closure matters to you; it
+  is what these numbers were measured with."
   [operation mesh-a mesh-b]
   (let [a (build-node (merged->polygons (topo/merge-coplanar (topo/welded-oriented mesh-a))))
         b (build-node (merged->polygons (topo/merge-coplanar (topo/welded-oriented mesh-b))))
@@ -244,4 +245,6 @@
                               a2 (clip-to a1 b2)
                               b3 (clip-to b2 a2)]
                           (-> (build-node a2 (all-polygons b3)) invert-node)))]
-    (polygons->mesh (all-polygons result))))
+    (-> (polygons->mesh (all-polygons result))
+        topo/repair-t-junctions
+        (select-keys [:positions :indices]))))

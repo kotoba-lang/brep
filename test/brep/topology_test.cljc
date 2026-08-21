@@ -109,33 +109,74 @@
     (testing "an intersection of two overlapping boxes is closed"
       (is (:closed? (closure :intersection big (box-mesh-at 5 5 15 15 0 4)))))))
 
-(deftest booleans-that-actually-cut-are-still-open
-  ;; Pinned, not accepted. Measured 2026-08-21 AFTER the winding fix: the cases
-  ;; where the two bodies genuinely cut each other still leak. Part of the damage
-  ;; is T-junctions (a vertex sitting in the middle of a neighbouring triangle's
-  ;; edge — geometrically closed, topologically cracked) and the larger part is
-  ;; polygons that are simply gone:
+(deftest booleans-that-cut-are-closed-too
+  ;; This test replaces `booleans-that-actually-cut-are-still-open`, which
+  ;; asserted the opposite on purpose so that fixing the CSG would announce
+  ;; itself. It did. Recording what the fix actually was, because three other
+  ;; explanations were tried first and all three were wrong:
   ;;
-  ;;   union, overlapping    18 boundary edges   6 T-junctions, 12 holes
-  ;;   difference, hole      28 boundary edges   8 T-junctions, 20 holes
-  ;;   difference, notch     14 boundary edges   6 T-junctions,  8 holes
+  ;;   - the csg.js transcription        checked step by step; it matches
+  ;;   - the fan triangulation of output replaced with an ear clipper; no change
+  ;;   - "polygons are being dropped"    FALSIFIED by measuring surface area:
+  ;;                                     the through-hole case came out at
+  ;;                                     392.000 against an analytic 392
   ;;
-  ;; The csg.js transcription has been checked against the original step by step
-  ;; and matches. The leading suspect is that this code is fed TRIANGLES where
-  ;; csg.js is fed quads, so each planar face arrives pre-split and its fragments
-  ;; fall below the three-vertex floor in `split-polygon`.
-  ;;
-  ;; These assertions say "still broken" on purpose. The day the CSG is fixed
-  ;; they fail, and that failure is the notification.
-  (let [big (box-mesh-at 0 0 10 10 0 4)]
-    (testing "overlapping union leaks"
-      (is (not (:closed? (closure :union big (box-mesh-at 5 5 15 15 0 4))))))
-    (testing "a through hole leaks"
-      (is (not (:closed? (closure :difference big (box-mesh-at 3 3 7 7 -1 6))))))
-    (testing "a corner notch leaks"
-      (is (not (:closed? (closure :difference big (box-mesh-at 8 8 12 12 -1 6))))))
-    (testing "and the extrusion they all start from is closed, so the pipeline is not at fault"
-      (is (:manifold? (topo/topology (box-mesh-at 0 0 10 10 0 4)))))))
+  ;; With the area exact, nothing was missing — the triangulation was simply not
+  ;; conforming. A BSP splits one side of a cut at the intersection points and
+  ;; leaves the other as a single span, so the top face carried [0,3]->[10,3]
+  ;; against [0,3]->[3,3], [3,3]->[7,3], [7,3]->[10,3]. Every one of those long
+  ;; edges belongs to one face, and `topology` rightly calls it a hole.
+  (let [big (box-mesh-at 0 0 10 10 0 4)
+        euler-of (fn [op a b] (topo/euler-characteristic (topo/topology (csg/mesh-boolean op a b))))]
+    (testing "an overlapping union closes"
+      (is (:closed? (closure :union big (box-mesh-at 5 5 15 15 0 4))))
+      (is (= 2 (euler-of :union big (box-mesh-at 5 5 15 15 0 4)))))
+
+    (testing "a through hole closes, and its Euler characteristic says genus 1"
+      ;; 0, not 2 — a block with a hole through it is a torus, and getting this
+      ;; number right is a stronger statement than "no boundary edges".
+      (is (:closed? (closure :difference big (box-mesh-at 3 3 7 7 -1 6))))
+      (is (= 0 (euler-of :difference big (box-mesh-at 3 3 7 7 -1 6)))))
+
+    (testing "a corner notch closes"
+      (is (:closed? (closure :difference big (box-mesh-at 8 8 12 12 -1 6))))
+      (is (= 2 (euler-of :difference big (box-mesh-at 8 8 12 12 -1 6)))))
+
+    (testing "surface area is the analytic value, as it was before the repair"
+      ;; The repair only re-triangulates: it must not move or add surface.
+      (let [m (csg/mesh-boolean :difference big (box-mesh-at 3 3 7 7 -1 6))
+            area (reduce + (map (fn [[a b c]]
+                                  (let [p (nth (:positions m) a) q (nth (:positions m) b)
+                                        r (nth (:positions m) c)
+                                        u (mapv - q p) v (mapv - r p)]
+                                    (* 0.5 (Math/sqrt (reduce + (map * (topo/-cross u v)
+                                                                    (topo/-cross u v)))))))
+                                (partition 3 (:indices m))))]
+        (is (< (Math/abs (- area 392.0)) 1.0e-9))))))
+
+(deftest t-junction-repair-reports-what-it-did
+  (testing "a mesh with no T-junctions is left alone and says so"
+    (let [r (topo/repair-t-junctions (box-mesh))]
+      (is (= 0 (:split-edges r)))
+      (is (= 0 (:passes r)))))
+
+  (testing "a span with a vertex on it is split, and the count is reported"
+    ;; Two triangles below a quad whose long edge runs past their shared corner.
+    (let [m {:positions [[0 0 0] [2 0 0] [1 1 0] [1 0 0]]
+             :indices [0 1 2]}
+          r (topo/repair-t-junctions m)]
+      (is (pos? (:split-edges r)))
+      (is (= 2 (/ (count (:indices r)) 3)))))
+
+  (testing "it refuses to loop forever, and says the repair is incomplete"
+    ;; `mesh-boolean` already repairs its own output, so a boolean result has
+    ;; nothing left to split — the fixture has to be an unrepaired mesh that
+    ;; does. With max-passes 0 the guard fires on the first look.
+    (let [r (topo/repair-t-junctions {:positions [[0 0 0] [2 0 0] [1 1 0] [1 0 0]]
+                                      :indices [0 1 2]}
+                                     1.0e-9 0)]
+      (is (:incomplete? r))
+      (is (= 0 (:passes r))))))
 
 (deftest coplanar-merge-puts-the-faces-back-together
   ;; csg.js takes a cube as six quads. A tessellated solid arrives as twelve

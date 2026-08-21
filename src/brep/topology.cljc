@@ -16,6 +16,7 @@
 
   All of it is pure `.cljc`, no I/O."
   (:require [brep.kernel :as k]
+            [brep.polygon :as poly]
             [brep.config :as config]))
 
 ;; ---------------------------------------------------------------------------
@@ -325,6 +326,12 @@
               (some #{nxt} chain) nil
               :else (recur (conj chain nxt) cur nxt))))))))
 
+(defn -cross
+  "Cross product. Public only so tests can compute triangle areas without
+  reaching into `brep.kernel`."
+  [a b]
+  (k/v-cross a b))
+
 (defn -loop-normal
   "Newell normal of a closed 3D loop. Public so tests can assert that merged
   loops wind outward — the property that made three boolean cases close."
@@ -372,3 +379,85 @@
                      [(oriented loop-ids region)]
                      (map (fn [fi] (mapv #(nth vs %) (nth (:faces topo) fi))) region)))
                  (coplanar-regions topo)))))
+
+;; ---------------------------------------------------------------------------
+;; T-junction repair
+;; ---------------------------------------------------------------------------
+
+(defn- point-on-segment
+  "Parameter t in (0,1) where `p` sits strictly inside segment a-b, or nil."
+  [p a b tol]
+  (let [ab (k/v- b a) ap (k/v- p a)
+        len (k/v-length ab)]
+    (when (pos? len)
+      (let [t (/ (k/v-dot ab ap) (* len len))
+            off (k/v-length (k/v-cross ab ap))]
+        (when (and (< (/ off len) tol) (< 1.0e-9 t (- 1.0 1.0e-9)))
+          t)))))
+
+(defn repair-t-junctions
+  "Re-triangulate `mesh` so that no edge of one face runs past a vertex sitting
+  on it, and return `{:positions :indices :split-edges :passes}`.
+
+  A boolean can produce a surface that is geometrically complete — total area
+  exactly the analytic value — and still report boundary edges everywhere,
+  because one side of a cut was split at the intersection points and the other
+  was left as one span. Measured on a 10x10x4 block with a 4x4 through hole:
+  the top face carried `[0,3]->[10,3]` on one side and `[0,3]->[3,3]`,
+  `[3,3]->[7,3]`, `[7,3]->[10,3]` on the other. Nothing is missing; the
+  triangulation is simply not conforming, so every one of those edges belongs
+  to a single face and `topology` calls it a hole.
+
+  This walks each face's edges, inserts the vertices found strictly inside
+  them, and ear-clips the enlarged polygon in its own plane. It repeats until a
+  pass finds nothing, because splitting one face can expose a vertex on a
+  neighbour."
+  ([mesh] (repair-t-junctions mesh 1.0e-9 8))
+  ([mesh tol max-passes]
+   (loop [m (weld-mesh mesh) pass 0 total 0]
+     (let [pts (:positions m)
+           faces (vec (map vec (partition 3 (:indices m))))
+           splits-for (fn [a b]
+                        (->> (range (count pts))
+                             (keep (fn [vi]
+                                     (when-not (or (= vi a) (= vi b))
+                                       (when-let [t (point-on-segment (nth pts vi) (nth pts a)
+                                                                      (nth pts b) tol)]
+                                         [t vi]))))
+                             (sort-by first)
+                             (mapv second)))
+           expanded (mapv (fn [[a b c]]
+                            (vec (concat [a] (splits-for a b)
+                                         [b] (splits-for b c)
+                                         [c] (splits-for c a))))
+                          faces)
+           found (reduce + (map (fn [f e] (- (count e) (count f))) faces expanded))]
+       (cond
+         (zero? found)
+         (assoc m :split-edges total :passes pass)
+
+         (>= pass max-passes)
+         ;; Refuse to loop forever on geometry that keeps producing splits. The
+         ;; caller gets what has been repaired plus the count, never a silent
+         ;; claim that the mesh is now conforming.
+         (assoc m :split-edges total :passes pass :incomplete? true)
+
+         :else
+         (let [tris (mapcat
+                     (fn [loop-ids]
+                       (if (= 3 (count loop-ids))
+                         [loop-ids]
+                         (let [ps (mapv #(nth pts %) loop-ids)
+                               n (-loop-normal ps)
+                               a (if (< (Math/abs (nth n 0)) 0.9) [1.0 0.0 0.0] [0.0 1.0 0.0])
+                               e1 (k/v-normalize (k/v-cross n a))
+                               e2 (k/v-cross n e1)
+                               o (first ps)
+                               flat (mapv (fn [p] (let [d (k/v- p o)]
+                                                    [(k/v-dot d e1) (k/v-dot d e2)])) ps)
+                               {:keys [indices]} (poly/triangulate-rings [flat])]
+                           (mapv (fn [t] (mapv #(nth loop-ids %) t)) (partition 3 indices)))))
+                     expanded)]
+           (recur {:positions pts :indices (vec (mapcat identity tris))
+                   :merged (:merged m) :degenerate (:degenerate m)}
+                  (inc pass) (+ total found))))))))
