@@ -461,3 +461,38 @@
            (recur {:positions pts :indices (vec (mapcat identity tris))
                    :merged (:merged m) :degenerate (:degenerate m)}
                   (inc pass) (+ total found))))))))
+
+;; ---------------------------------------------------------------------------
+;; Half-space solids — what an edge feature cuts with
+;; ---------------------------------------------------------------------------
+
+(defn half-space-box
+  "A closed box mesh covering the half-space on the `normal` side of the plane
+  through `origin`, out to `extent` in every direction.
+
+  A chamfer on a planar-faced solid IS a plane cut, and a plane cut through a
+  mesh boolean needs a solid to subtract rather than an infinite half-space.
+  `extent` has to exceed the part; callers size it from the part's own bounding
+  box so the cut never stops short of an edge — a chamfer that quietly ends
+  mid-edge is worse than one that fails."
+  [origin normal extent]
+  (let [n (k/v-normalize normal)
+        a (if (< (Math/abs (nth n 0)) 0.9) [1.0 0.0 0.0] [0.0 1.0 0.0])
+        u (k/v-normalize (k/v-cross n a))
+        v (k/v-cross n u)
+        e (double extent)
+        corner (fn [su sv sn]
+                 (k/v+ origin (k/v+ (k/v-scale u (* su e))
+                                    (k/v+ (k/v-scale v (* sv e))
+                                          (k/v-scale n (* sn e))))))
+        pts [(corner -1 -1 0) (corner 1 -1 0) (corner 1 1 0) (corner -1 1 0)
+             (corner -1 -1 2) (corner 1 -1 2) (corner 1 1 2) (corner -1 1 2)]
+        quads [[0 3 2 1] [4 5 6 7] [0 1 5 4] [1 2 6 5] [2 3 7 6] [3 0 4 7]]
+        tris (mapcat (fn [[a b c d]] [[a b c] [a c d]]) quads)]
+    {:positions (vec pts) :indices (vec (mapcat identity tris))}))
+
+(defn mesh-bounds
+  "`[min max]` of a mesh's positions."
+  [{:keys [positions]}]
+  [(mapv (fn [i] (apply min (map #(nth % i) positions))) [0 1 2])
+   (mapv (fn [i] (apply max (map #(nth % i) positions))) [0 1 2])])

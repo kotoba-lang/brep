@@ -16,6 +16,7 @@
   change detectors."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as string]
+            [brep.topology :as topo]
             [brep.feature :as f]
             [brep.assembly :as a]
             [brep.kernel :as k]
@@ -410,3 +411,83 @@
                             (f/add-feature (f/sweep-feature 3 1 2 :new))))]
       (is (= :error status))
       (is (string/includes? msg "single OPEN chain")))))
+
+(defn- mesh-volume [m]
+  (Math/abs
+   (/ (reduce + (map (fn [[a b c]]
+                       (let [p (nth (:positions m) a) q (nth (:positions m) b)
+                             r (nth (:positions m) c)]
+                         (reduce + (map * p [(- (* (q 1) (r 2)) (* (q 2) (r 1)))
+                                             (- (* (q 2) (r 0)) (* (q 0) (r 2)))
+                                             (- (* (q 0) (r 1)) (* (q 1) (r 0)))]))))
+                     (partition 3 (:indices m))))
+      6.0)))
+
+(defn- block-tree []
+  (-> (f/feature-tree)
+      (f/add-feature (f/sketch-feature 1 (f/sketch-plane-xy)
+                                       [(f/sketch-line [0 0] [10 0]) (f/sketch-line [10 0] [10 10])
+                                        (f/sketch-line [10 10] [0 10]) (f/sketch-line [0 10] [0 0])]))
+      (f/add-feature (f/extrude-feature 2 1 [0 0 1] 6 :new))))
+
+(deftest chamfer-removes-exactly-the-analytic-wedge
+  ;; A chamfer on a solid with planar faces IS a plane cut, so the material it
+  ;; takes off one edge is a triangular prism: 1/2 d^2 L exactly. Asserting the
+  ;; volume against that closed form is what separates a chamfer from a mesh
+  ;; that merely gained triangles — the first attempt here routed its result
+  ;; through `combine` with `:new`, which falls to :union, and put the removed
+  ;; material straight back: volume unchanged at 600, every dihedral still 90
+  ;; degrees, triangle count up from 12 to 52. A cut that adds triangles and
+  ;; changes nothing is the most convincing kind of wrong.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        bottom-front (first (filter (fn [[i j]]
+                                      (let [t (topo/topology m0)
+                                            a (nth (:vertices t) i) b (nth (:vertices t) j)]
+                                        (and (zero? (double (a 1))) (zero? (double (b 1)))
+                                             (zero? (double (a 2))) (zero? (double (b 2))))))
+                                    (topo/sharp-edges (topo/topology m0) :convex 0.2)))]
+    (testing "the block starts at 600"
+      (is (= 600.0 (double (mesh-volume m0)))))
+
+    (doseq [d [0.5 1.0 2.0]]
+      (testing (str "one edge chamfered at d=" d " removes 1/2 d^2 L")
+        (let [[status m] (f/evaluate-mesh
+                          (f/add-feature base (f/chamfer-feature 3 [bottom-front] d)))]
+          (is (= :ok status))
+          (is (< (Math/abs (- (mesh-volume m) (- 600.0 (* 0.5 d d 10.0)))) 1.0e-9))
+          (is (empty? (topo/boundary-edges (topo/topology m)))))))))
+
+(deftest chamfering-every-convex-edge-keeps-the-solid-closed
+  (let [[status m] (f/evaluate-mesh
+                    (f/add-feature (block-tree) (f/chamfer-feature 3 :all-convex 1.0)))
+        t (topo/topology m)
+        normal-angles (frequencies (map #(Math/round (* 180.0 (/ (:dihedral %) Math/PI)))
+                                        (filter #(= :manifold (:kind %)) (vals (:edges t)))))]
+    (is (= :ok status))
+    (testing "still a closed solid"
+      (is (empty? (topo/boundary-edges t)))
+      (is (= 2 (topo/euler-characteristic t))))
+    (testing "no 90-degree edge survives — every one was cut"
+      (is (nil? (get normal-angles 90))))
+    (testing "two chamfer edges per original edge, at 45 degrees between normals"
+      (is (= 24 (get normal-angles 45))))
+    (testing "and three chamfers meeting at each of the 8 corners"
+      (is (= 24 (get normal-angles 60))))))
+
+(deftest chamfer-refuses-selectors-it-cannot-honour
+  (let [base (block-tree)
+        err (fn [feat] (second (f/evaluate-mesh (f/add-feature base feat))))]
+    (testing "BREP edge ids do not exist on the mesh, and are refused by name"
+      ;; Guessing a mapping would chamfer edges nobody selected — a wrong part
+      ;; that builds.
+      (is (string/includes? (err (f/chamfer-feature 3 [1 2 3] 1.0)) ":all-convex")))
+    (testing "a non-positive distance is refused"
+      (is (string/includes? (err (f/chamfer-feature 3 :all-convex 0)) "positive :distance")))
+    (testing "an empty selection is refused rather than silently doing nothing"
+      (is (string/includes? (err (f/chamfer-feature 3 [] 1.0)) ":all-convex")))
+    (testing "a chamfer with no body under it is refused"
+      (is (string/includes?
+           (second (f/evaluate-mesh (-> (f/feature-tree)
+                                        (f/add-feature (f/chamfer-feature 3 :all-convex 1.0)))))
+           "no body to cut")))))
