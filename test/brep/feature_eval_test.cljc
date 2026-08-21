@@ -250,16 +250,22 @@
   (testing "the supported set is derived from the registry, not restated"
     (is (contains? (f/supported-feature-kinds) :extrude))
     (is (contains? (f/supported-feature-kinds) :sketch))
-    (is (not (contains? (f/supported-feature-kinds) :fillet))))
+    ;; `:fillet` was this test's example of an UNREGISTERED kind until
+    ;; 2026-08-22, which is the right way for it to have been written: the
+    ;; assertion had to change when the capability arrived, rather than the
+    ;; capability arriving unnoticed. `:revolve` has a constructor and no
+    ;; evaluator, so it plays that part now.
+    (is (contains? (f/supported-feature-kinds) :fillet))
+    (is (not (contains? (f/supported-feature-kinds) :revolve))))
 
   (testing "an unregistered kind refuses BY NAME and names what is registered"
     (let [tree (-> (f/feature-tree)
                    (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
                    (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new))
-                   (f/add-feature (f/fillet-feature 3 [1] 1.0)))
+                   (f/add-feature (f/revolve-feature 3 1 [0 0 1] 360 :new)))
           [status msg] (f/evaluate-mesh tree)]
       (is (= :error status))
-      (is (string/includes? msg ":fillet"))
+      (is (string/includes? msg ":revolve"))
       (is (string/includes? msg "no evaluator is registered"))
       (is (string/includes? msg ":extrude"))
       (is (string/includes? msg ":loft")))))
@@ -564,3 +570,127 @@
 
   (testing "shell is registered, so the registry answers for it"
     (is (contains? (f/supported-feature-kinds) :shell))))
+
+(defn- edge-at
+  "The convex mesh edge whose two endpoints both satisfy `pred`."
+  [m pred]
+  (let [t (topo/topology m)]
+    (first (filter (fn [[i j]]
+                     (and (pred (nth (:vertices t) i)) (pred (nth (:vertices t) j))))
+                   (topo/sharp-edges t :convex 0.2)))))
+
+(deftest fillet-removes-the-analytic-quarter-lune-and-converges
+  ;; A fillet is not a plane cut — that is the whole difference from chamfer —
+  ;; but what it removes still has a closed form: the cross-section is an
+  ;; r-by-r square with a quarter disc taken out, so one edge of length L
+  ;; loses exactly L r^2 (1 - pi/4). The arc is inscribed, so the tessellated
+  ;; tool removes slightly MORE than that, converging from above at second
+  ;; order in the segment count.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        r 1.0
+        exact (* 10.0 r r (- 1.0 (/ Math/PI 4.0)))
+        rel (fn [segs]
+              (let [[status m] (f/evaluate-mesh
+                                (f/add-feature base {:kind :fillet :id 3 :edges [e]
+                                                     :radius r :segments segs}))]
+                (is (= :ok status) (str "segments " segs ": " (pr-str m)))
+                (is (empty? (topo/boundary-edges (topo/topology m))))
+                (/ (- (- 600.0 (mesh-volume m)) exact) exact)))
+        e8 (rel 8) e16 (rel 16) e32 (rel 32)]
+    (testing "always removes more than the exact lune, because the arc is inscribed"
+      (is (pos? e8)) (is (pos? e16)) (is (pos? e32)))
+    (testing "and converges at second order"
+      (is (< (Math/abs (- (/ e8 e16) 4.0)) 0.5) (str "e8/e16 = " (/ e8 e16)))
+      (is (< (Math/abs (- (/ e16 e32) 4.0)) 0.5) (str "e16/e32 = " (/ e16 e32)))
+      (is (< e32 2.0e-3)))))
+
+(deftest a-fillet-is-smooth-where-the-edge-was-sharp
+  ;; The measurement that separates a fillet from a chamfer: after rounding,
+  ;; the facets along the old edge meet at 90/segments degrees, not at 90.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        segs 16
+        [_ m] (f/evaluate-mesh (f/add-feature base {:kind :fillet :id 3 :edges [e]
+                                                    :radius 1.0 :segments segs}))
+        t (topo/topology m)
+        angles (->> (vals (:edges t))
+                    (filter #(= :manifold (:kind %)))
+                    (map #(Math/round (* 180.0 (/ (:dihedral %) Math/PI))))
+                    frequencies)
+        arc-angle (Math/round (/ 90.0 segs))]
+    (testing "the arc contributes segments-1 interior edges at 90/segments degrees"
+      (is (= (dec segs) (get angles arc-angle))
+          (str "dihedral histogram was " (into (sorted-map) angles))))
+    (testing "and the rest of the block is still sharp"
+      (is (pos? (get angles 90 0))
+          (str "dihedral histogram was " (into (sorted-map) angles))))
+    (testing "while nothing on the rounded edge is"
+      ;; A chamfer of the same edge would leave two 45-degree edges and no arc;
+      ;; the arc angle appearing segments-1 times is what says this is a blend.
+      (is (nil? (get angles 45))))))
+
+(deftest two-edges-that-do-not-touch-remove-twice-as-much
+  ;; Adjacent edges' tools overlap near their shared vertex, so the removed
+  ;; volume is LESS than the sum — correctly, since the overlap is removed
+  ;; once. Parallel edges on opposite corners have no overlap, and there the
+  ;; sum is the right answer.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e1 (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        e2 (edge-at m0 (fn [p] (and (= 10.0 (double (p 1))) (= 6.0 (double (p 2))))))
+        ;; 20 rather than 16: measured, this pair at 16 segments comes back
+        ;; with 6 boundary edges. The sporadic failure documented in the
+        ;; evaluator is real and is not hidden by choosing round numbers.
+        r 0.5 segs 20
+        exact (* 2.0 10.0 r r (- 1.0 (/ Math/PI 4.0)))
+        [status m] (f/evaluate-mesh (f/add-feature base {:kind :fillet :id 3 :edges [e1 e2]
+                                                         :radius r :segments segs}))]
+    (is (some? e2))
+    (is (= :ok status) (pr-str m))
+    (is (empty? (topo/boundary-edges (topo/topology m))))
+    (is (< (Math/abs (/ (- (- 600.0 (mesh-volume m)) exact) exact)) 0.02)
+        (str "removed " (- 600.0 (mesh-volume m)) " vs 2 x " (/ exact 2.0)))))
+
+(deftest fillet-refuses-rather-than-returning-a-shape-nobody-asked-for
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        run (fn [feat] (f/evaluate-mesh (f/add-feature base feat)))]
+    (testing "one segment is a chamfer"
+      (let [[status msg] (run {:kind :fillet :id 3 :edges [e] :radius 1.0 :segments 1})]
+        (is (= :error status))
+        (is (string/includes? msg "is a chamfer"))))
+
+    (testing "a radius at least half the edge length would cut past the far end"
+      (let [[status msg] (run {:kind :fillet :id 3 :edges [e] :radius 6.0 :segments 8})]
+        (is (= :error status))
+        (is (string/includes? msg "no closure check would reject"))))
+
+    (is (= :error (first (run {:kind :fillet :id 3 :edges [e] :radius 0.0 :segments 8}))))
+    (is (= :error (first (run {:kind :fillet :id 3 :edges :every-edge :radius 1.0 :segments 8}))))
+
+    (testing "and when the boolean cannot do it, that is said rather than shipped"
+      ;; Measured: twelve edges at eight segments exhausts the BSP, and some
+      ;; radius/segment pairs return an OPEN surface. Both are reported.
+      (let [[status msg] (run {:kind :fillet :id 3 :edges :all-convex :radius 0.5 :segments 8})]
+        (is (= :error status))
+        (is (or (string/includes? msg "exhausted the boolean solver")
+                (string/includes? msg "boundary edge")))))
+
+    (testing "a combination the boolean gets wrong is refused, not returned"
+      ;; Two parallel edges at 16 segments comes back with 6 boundary edges —
+      ;; a surface, not a solid, and one whose volume is wrong. Removing the
+      ;; closure check left every other assertion in this file green, so this
+      ;; pins the known-bad pair. The failure is sporadic in the segment count
+      ;; (4, 6, 8, 10, 20, 24 and 32 all work for this same pair), which is
+      ;; why it is the BOOLEAN that is suspect and not the tool.
+      (let [e2 (edge-at m0 (fn [p] (and (= 10.0 (double (p 1))) (= 6.0 (double (p 2))))))
+            [status msg] (run {:kind :fillet :id 3 :edges [e e2] :radius 0.5 :segments 16})]
+        (is (= :error status))
+        (is (string/includes? msg "boundary edge"))))
+
+    (testing "fillet is registered, so the registry answers for it"
+      (is (contains? (f/supported-feature-kinds) :fillet)))))
