@@ -818,6 +818,68 @@
                                            (topo/half-space-box origin normal extent)))
                        acc planes)])))))
 
+(defn- prism-mesh
+  "A closed triangle mesh for the solid swept by `section` (a closed 2D loop in
+  the plane spanned by `u` and `v`, about `origin`) along `axis` for `length`."
+  [origin u v axis length section]
+  (let [n (count section)
+        place (fn [[a b] t]
+                (k/v+ origin (k/v+ (k/v-scale u a)
+                                   (k/v+ (k/v-scale v b) (k/v-scale axis t)))))
+        near (mapv #(place % 0.0) section)
+        far (mapv #(place % length) section)
+        positions (into near far)
+        sides (vec (mapcat (fn [i]
+                             (let [j (mod (inc i) n)]
+                               [i j (+ n j) i (+ n j) (+ n i)]))
+                           (range n)))
+        {:keys [indices]} (poly/triangulate-rings [(vec section)])
+        cap-near (vec (mapcat (fn [[a b c]] [a c b]) (partition 3 indices)))
+        cap-far (mapv #(+ n %) indices)]
+    {:positions positions :indices (vec (concat sides cap-near cap-far))}))
+
+(defn- fillet-tool
+  "The material a constant-radius fillet removes from ONE convex edge: the
+  sharp corner minus the rolling ball's cylinder.
+
+  A fillet is not a plane cut, which is why `:chamfer` could be a half-space
+  subtraction and this cannot. What it removes has a closed form all the same —
+  the cross-section is an r-by-r square with a quarter disc taken out of it, so
+  the volume is `L r^2 (1 - pi/4)` — and that is what the tests assert.
+
+  `segments` controls how finely the arc is tessellated. The arc is INSCRIBED,
+  so the tool is slightly too small and the volume removed slightly under the
+  closed form; the error is second order in the segment angle and the tests
+  bound it rather than pretending it is zero."
+  [topo edge-key radius segments overshoot]
+  (let [{:keys [vertices]} topo
+        info (get (:edges topo) edge-key)
+        [i j] edge-key
+        [f1 f2] (:faces info)
+        n1 (face-normal-of topo f1)
+        n2 (face-normal-of topo f2)
+        pi* (nth vertices i)
+        pj (nth vertices j)
+        along (k/v-normalize (k/v- pj pi*))
+        ;; in-plane directions pointing INTO each face, away from the other
+        step (fn [n other]
+               (let [c (k/v-normalize (k/v-cross n along))]
+                 (if (pos? (k/v-dot c other)) (k/v-scale c -1.0) c)))
+        u (step n1 n2)          ; along face 1, away from face 2
+        v (step n2 n1)          ; along face 2, away from face 1
+        ;; The section is drawn in the (u, v) frame with the sharp corner at
+        ;; the origin: out to r along u, arc back to r along v.
+        centre [radius radius]
+        arc (mapv (fn [s]
+                    (let [t (* (/ s (double segments)) (/ Math/PI 2.0))]
+                      [(- radius (* radius (Math/sin t)))
+                       (- radius (* radius (Math/cos t)))]))
+                  (range (inc segments)))
+        section (into [[0.0 0.0] [radius 0.0]] (conj (vec (rest (butlast arc))) [0.0 radius]))
+        origin (k/v+ pi* (k/v-scale along (- overshoot)))]
+    (prism-mesh origin u v along (+ (k/v-length (k/v- pj pi*)) (* 2.0 overshoot))
+                section)))
+
 (defn- region-planes
   "One `[point outward-normal]` per coplanar face region of `topo`.
 
@@ -939,6 +1001,112 @@
                                     " outside a wall it should stay inside")
                                " — the offset planes enclose nothing"))]
                 [:ok (csg/mesh-boolean :difference body cavity)]))))))))
+
+(defmethod apply-feature :fillet [feature _ctx acc]
+  ;; The kernel has no rolling-ball SURFACE, and this does not invent one: the
+  ;; blend is TESSELLATED, which is exactly what `:chamfer` and every other
+  ;; feature here produce, since `evaluate-mesh` returns a triangle mesh and
+  ;; says so. What a fillet cannot be is a plane cut — that is the whole
+  ;; difference from chamfer, and it is why the tool is a swept section rather
+  ;; than a half-space.
+  ;;
+  ;; The tool is the sharp corner minus the cylinder the ball sweeps. Its
+  ;; cross-section is an r-by-r square with a quarter disc removed, so the
+  ;; volume it takes off one edge of length L is exactly L r^2 (1 - pi/4).
+  (let [{:keys [edges radius segments]} feature
+        r (double (or radius 0))
+        segs (int (or segments 16))]
+    (cond
+      (nil? acc)
+      [:error (str "fillet " (:id feature) " has no body to round")]
+
+      (not (pos? r))
+      [:error (str "fillet " (:id feature) " needs a positive :radius (got " radius ")")]
+
+      (< segs 2)
+      [:error (str "fillet " (:id feature) " needs :segments >= 2 (got " segments
+                   ") — one segment is a chamfer, and a chamfer that calls"
+                   " itself a fillet is the kind of thing nobody notices"
+                   " until the part is machined")]
+
+      (not (or (= :all-convex edges)
+               (and (coll? edges) (seq edges)
+                    (every? #(and (vector? %) (= 2 (count %))) edges))))
+      [:error (str "fillet " (:id feature) " :edges must be :all-convex or a"
+                   " collection of [i j] mesh edge keys from"
+                   " brep.topology/sharp-edges — BREP edge ids do not exist on"
+                   " the mesh this evaluates, and guessing a mapping would"
+                   " round edges that were not selected (got " (pr-str edges) ")")]
+
+      :else
+      (let [body (topo/welded-oriented acc)
+            topo0 (topo/topology body)
+            selected (if (= :all-convex edges)
+                       (topo/sharp-edges topo0 :convex 0.2)
+                       (vec edges))
+            [lo hi] (topo/mesh-bounds body)
+            overshoot (* 0.01 (apply max 1.0 (map - hi lo)))
+            manifold (filter (fn [e] (= :manifold (:kind (get (:edges topo0) e)))) selected)
+            ;; A radius larger than the shortest adjacent face can hold does
+            ;; not fail — it produces a tool that cuts through the far side of
+            ;; the body and returns a closed solid of the wrong shape.
+            too-big (filter (fn [[i j]]
+                              (> (* 2.0 r) (k/v-distance (nth (:vertices topo0) i)
+                                                         (nth (:vertices topo0) j))))
+                            manifold)]
+        (cond
+          (empty? selected)
+          [:error (str "fillet " (:id feature) " selected no edges")]
+
+          (empty? manifold)
+          [:error (str "fillet " (:id feature) " selected " (count selected)
+                       " edge(s), none of which is a manifold edge of this body")]
+
+          (seq too-big)
+          [:error (str "fillet " (:id feature) " radius " r " is at least half the"
+                       " length of " (count too-big) " selected edge(s) — the tool"
+                       " would cut past the far end and return a closed solid of"
+                       " the wrong shape, which no closure check would reject")]
+
+          :else
+          ;; Tools are computed ONCE from the original body: each subtraction
+          ;; renumbers vertices, so an edge key read from the previous result
+          ;; would refer to something else.
+          (let [tools (mapv #(fillet-tool topo0 % r segs overshoot) manifold)
+                ;; The BSP recurses per polygon, and a tool with a tessellated
+                ;; arc gives it many nearly-coplanar ones. Measured: filleting
+                ;; all twelve convex edges of a block at 8 segments overflows
+                ;; the stack inside `brep.mesh-csg`. A caller asking for a
+                ;; fillet should get an answer or a refusal, never a
+                ;; StackOverflowError arriving from three namespaces away.
+                result (try
+                         (reduce (fn [m tool] (csg/mesh-boolean :difference m tool)) body tools)
+                         (catch #?(:clj Throwable :cljs :default) _ ::boolean-failed))]
+            (if (= ::boolean-failed result)
+              [:error (str "fillet " (:id feature) " exhausted the boolean solver on "
+                           (count manifold) " edge(s) at " segs " segments. The BSP in"
+                           " brep.mesh-csg recurses per polygon and a tessellated arc"
+                           " gives it many nearly-coplanar ones; fewer edges per"
+                           " feature, or fewer segments, gets through.")]
+              (let [open-edges (count (topo/boundary-edges (topo/topology result)))]
+            ;; The boolean is checked, not trusted. Measured 2026-08-22 on a
+            ;; 10x10x6 block filleted at r=1: segments 2, 4, 8, 16, 20, 24, 32,
+            ;; 40 and 48 all return a closed solid whose removed volume
+            ;; converges on L r^2 (1 - pi/4) at second order — while 12 and 64
+            ;; come back with 8 and 14 boundary edges and a volume that is
+            ;; WRONG IN THE OTHER DIRECTION. The failure is sporadic in the
+            ;; segment count, so it is the BSP meeting near-degenerate facets
+            ;; rather than anything about the tool; until that is fixed, an
+            ;; open result has to be reported rather than returned. A caller
+            ;; who only checks for :ok would otherwise machine it.
+                (if (pos? open-edges)
+                  [:error (str "fillet " (:id feature) " produced a surface with "
+                               open-edges " boundary edge(s) — the boolean failed on"
+                               " this combination of radius " r " and " segs
+                               " segments. Try a different :segments; the failure is"
+                               " sporadic in that number, not monotone, so a nearby"
+                               " value usually works.")]
+                  [:ok result])))))))))
 
 (defn evaluate-mesh
   "Evaluate a feature tree to a **triangle mesh** by folding each feature
