@@ -338,3 +338,75 @@
           [status msg] (f/evaluate-mesh t)]
       (is (= :error status))
       (is (string/includes? msg "Selective patterning is not implemented")))))
+
+(defn- unit-square-profile [id plane]
+  (f/sketch-feature id plane
+                    [(f/sketch-line [-1 -1] [1 -1]) (f/sketch-line [1 -1] [1 1])
+                     (f/sketch-line [1 1] [-1 1]) (f/sketch-line [-1 1] [-1 -1])]))
+
+(deftest sketch-polyline-chains-open-paths-only
+  (testing "an open chain walks from one free end to the other"
+    (is (= [[0 0] [0 10] [8 10]]
+           (f/sketch->polyline
+            (f/sketch-feature 1 (f/sketch-plane-xz)
+                              [(f/sketch-line [0 0] [0 10]) (f/sketch-line [0 10] [8 10])])))))
+
+  (testing "a closed loop is not an open path — ask sketch->ring"
+    (is (nil? (f/sketch->polyline (unit-square-profile 2 (f/sketch-plane-xy))))))
+
+  (testing "a branch is refused: which branch is the path is a decision"
+    (is (nil? (f/sketch->polyline
+               (f/sketch-feature 3 (f/sketch-plane-xy)
+                                 [(f/sketch-line [0 0] [4 0]) (f/sketch-line [4 0] [8 0])
+                                  (f/sketch-line [4 0] [4 4])]))))))
+
+(deftest sweep-carries-the-section-around-a-corner
+  (let [profile (unit-square-profile 1 (f/sketch-plane-xy))
+        run (fn [path-entities]
+              (f/evaluate-mesh
+               (-> (f/feature-tree)
+                   (f/add-feature profile)
+                   (f/add-feature (f/sketch-feature 2 (f/sketch-plane-xz) path-entities))
+                   (f/add-feature (f/sweep-feature 3 1 2 :new)))))]
+
+    (testing "a straight path reproduces the extrusion it is equivalent to"
+      (let [[status mesh] (run [(f/sketch-line [0 0] [0 10])])]
+        (is (= :ok status))
+        (is (= [[-1.0 -1.0 0.0] [1.0 1.0 10.0]]
+               (mapv #(mapv double %) (bbox mesh))))))
+
+    (testing "an L-path mitres the corner — the section ROTATED, it was not merely translated"
+      ;; A translate-only sweep leaves the far leg lying in the z-range of the
+      ;; first, so zmax stays 10 and the solid pinches at the turn. Carrying the
+      ;; frame puts the outer corner at 10 + half-width = 11. That single number
+      ;; is the difference between a sweep and a wrong shape that renders.
+      (let [[status mesh] (run [(f/sketch-line [0 0] [0 10]) (f/sketch-line [0 10] [8 10])])
+            [[xmin _ zmin] [xmax _ zmax]] (bbox mesh)]
+        (is (= :ok status))
+        (is (= 11.0 (double zmax)))
+        (is (= 8.0 (double xmax)))
+        (is (= [-1.0 0.0] [(double xmin) (double zmin)]))))
+
+    (testing "every index addresses a position that exists"
+      (let [[_ mesh] (run [(f/sketch-line [0 0] [0 10]) (f/sketch-line [0 10] [8 10])])]
+        (is (every? #(< -1 % (count (:positions mesh))) (:indices mesh)))))))
+
+(deftest sweep-refuses-what-it-cannot-decide
+  (testing "a profile that does not face along the path start is refused, not reinterpreted"
+    (let [[status msg] (f/evaluate-mesh
+                        (-> (f/feature-tree)
+                            (f/add-feature (unit-square-profile 1 (f/sketch-plane-xz)))
+                            (f/add-feature (f/sketch-feature 2 (f/sketch-plane-xz)
+                                                             [(f/sketch-line [0 0] [0 10])]))
+                            (f/add-feature (f/sweep-feature 3 1 2 :new))))]
+      (is (= :error status))
+      (is (string/includes? msg "perpendicular to the start of the path"))))
+
+  (testing "a closed path is refused with the reason"
+    (let [[status msg] (f/evaluate-mesh
+                        (-> (f/feature-tree)
+                            (f/add-feature (unit-square-profile 1 (f/sketch-plane-xy)))
+                            (f/add-feature (unit-square-profile 2 (f/sketch-plane-xz)))
+                            (f/add-feature (f/sweep-feature 3 1 2 :new))))]
+      (is (= :error status))
+      (is (string/includes? msg "single OPEN chain")))))
