@@ -253,3 +253,122 @@
         faces (vec (map vec (partition 3 indices)))
         [oriented _] (if (seq faces) (orient-faces positions faces) [faces true])]
     {:positions positions :indices (vec (mapcat identity oriented))}))
+
+;; ---------------------------------------------------------------------------
+;; Coplanar merge — putting the faces back together before a boolean sees them
+;; ---------------------------------------------------------------------------
+
+(defn coplanar-regions
+  "Maximal connected groups of faces that share a plane, as vectors of face
+  indices. Two faces join when they share an edge, their normals agree within
+  `angle-tol` radians, and they lie in the same plane within `plane-tol`.
+
+  Both conditions are needed: parallel faces on opposite sides of a slab have
+  identical normals and are not the same face."
+  ([topo] (coplanar-regions topo 1.0e-9 1.0e-9))
+  ([{:keys [vertices faces edges]} angle-tol plane-tol]
+   (let [normal (fn [[a b c]]
+                  (k/v-normalize (k/v-cross (k/v- (nth vertices b) (nth vertices a))
+                                            (k/v- (nth vertices c) (nth vertices a)))))
+         normals (mapv normal faces)
+         offset (fn [fi] (k/v-dot (nth normals fi) (nth vertices (first (nth faces fi)))))
+         offsets (mapv offset (range (count faces)))
+         neighbours (reduce (fn [m [_ {:keys [faces kind]}]]
+                              (if (= :manifold kind)
+                                (let [[a b] faces]
+                                  (-> m (update a (fnil conj #{}) b)
+                                      (update b (fnil conj #{}) a)))
+                                m))
+                            {} edges)
+         same? (fn [i j]
+                 (and (< (- 1.0 (k/v-dot (nth normals i) (nth normals j))) angle-tol)
+                      (< (Math/abs (- (nth offsets i) (nth offsets j))) plane-tol)))]
+     (loop [remaining (set (range (count faces))) out []]
+       (if (empty? remaining)
+         out
+         (let [seed (first remaining)
+               region (loop [stack [seed] seen #{seed}]
+                        (if (empty? stack)
+                          seen
+                          (let [fi (peek stack)
+                                grow (filter #(and (remaining %) (not (seen %)) (same? fi %))
+                                             (get neighbours fi #{}))]
+                            (recur (into (pop stack) grow) (into seen grow)))))]
+           (recur (reduce disj remaining region) (conj out (vec (sort region))))))))))
+
+(defn region-loop
+  "The single boundary loop of `region` as an ordered vector of vertex indices,
+  or nil when the region's boundary is not exactly one simple loop.
+
+  Returns nil rather than a guess for a region with a hole or a pinch: a
+  polygon with two loops is not a polygon, and handing one to a BSP that
+  assumes convex-decomposable simple polygons produces a shape nobody asked
+  for."
+  [{:keys [faces]} region]
+  (let [tris (map #(nth faces %) region)
+        counted (frequencies (mapcat (fn [[a b c]]
+                                       [(if (< a b) [a b] [b a])
+                                        (if (< b c) [b c] [c b])
+                                        (if (< c a) [c a] [a c])])
+                                     tris))
+        border (vec (keep (fn [[e n]] (when (= 1 n) e)) counted))
+        adj (reduce (fn [m [a b]] (-> m (update a (fnil conj []) b)
+                                      (update b (fnil conj []) a)))
+                    {} border)]
+    (when (and (seq border) (every? #(= 2 (count (val %))) adj))
+      (let [start (first (sort (keys adj)))]
+        (loop [chain [start] prev nil cur start]
+          (let [nxt (first (remove #(= % prev) (get adj cur)))]
+            (cond
+              (nil? nxt) nil
+              (= nxt start) (when (= (count chain) (count adj)) chain)
+              (some #{nxt} chain) nil
+              :else (recur (conj chain nxt) cur nxt))))))))
+
+(defn -loop-normal
+  "Newell normal of a closed 3D loop. Public so tests can assert that merged
+  loops wind outward — the property that made three boolean cases close."
+  [pts]
+  (k/v-normalize
+   (reduce (fn [acc [[ax ay az] [bx by bz]]]
+             (k/v+ acc [(* (- ay by) (+ az bz))
+                        (* (- az bz) (+ ax bx))
+                        (* (- ax bx) (+ ay by))]))
+           [0.0 0.0 0.0]
+           (map vector pts (concat (rest pts) [(first pts)])))))
+
+(defn merge-coplanar
+  "`mesh` as a vector of planar polygons (each a vector of 3D points), with
+  coplanar neighbours welded back into one face.
+
+  A BSP boolean splits polygons against planes and discards fragments with
+  fewer than three vertices. Feeding it a TRIANGULATED box hands it two
+  coplanar triangles per face instead of one quad, so every plane that should
+  cut one polygon cuts two, and the extra fragments are where the holes come
+  from. This is the inverse operation, applied before the boolean.
+
+  Regions whose boundary is not a single simple loop stay as their individual
+  triangles — merging them would need a polygon-with-holes representation the
+  BSP does not have."
+  [mesh]
+  (let [topo (topology mesh)
+        vs (:vertices topo)
+        fnorm (fn [[a b c]] (k/v-normalize (k/v-cross (k/v- (nth vs b) (nth vs a))
+                                                      (k/v- (nth vs c) (nth vs a)))))
+        ;; `region-loop` chains border edges without regard to which way the
+        ;; region's faces are wound, so half the loops come back reversed. That
+        ;; reintroduces at the POLYGON level exactly the defect `orient-faces`
+        ;; removes at the face level — a BSP reading front/back off a normal
+        ;; that points the wrong way. Measured: leaving this out turned three
+        ;; previously-closed boolean cases open again.
+        oriented (fn [loop-ids region]
+                   (let [want (fnorm (nth (:faces topo) (first region)))
+                         pts (mapv #(nth vs %) loop-ids)
+                         got (k/v-normalize (k/v-cross (k/v- (nth pts 1) (nth pts 0))
+                                                       (k/v- (nth pts 2) (nth pts 0))))]
+                     (if (neg? (k/v-dot want got)) (vec (reverse pts)) pts)))]
+    (vec (mapcat (fn [region]
+                   (if-let [loop-ids (region-loop topo region)]
+                     [(oriented loop-ids region)]
+                     (map (fn [fi] (mapv #(nth vs %) (nth (:faces topo) fi))) region)))
+                 (coplanar-regions topo)))))

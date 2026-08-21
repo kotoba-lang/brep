@@ -1,6 +1,7 @@
 (ns brep.mesh-csg
   "Portable BSP-based boolean operations for closed triangle meshes."
-  (:require [brep.topology :as topo]))
+  (:require [brep.topology :as topo]
+            [brep.polygon :as poly]))
 
 (def ^:private epsilon 1.0e-7)
 (def ^:private coplanar 0)
@@ -120,6 +121,16 @@
     (vec (concat (:polygons node) (all-polygons (:front node)) (all-polygons (:back node))))
     []))
 
+(defn- merged->polygons
+  "Build BSP polygons from coplanar-merged planar loops. Each loop becomes ONE
+  polygon, which is the shape csg.js was written for — see `mesh-boolean`."
+  [loops]
+  (mapv (fn [pts]
+          (let [n (normalize (cross (v- (nth pts 1) (nth pts 0))
+                                    (v- (nth pts 2) (nth pts 0))))]
+            (polygon (mapv (fn [p] {:position p :normal n}) pts))))
+        loops))
+
 (defn- mesh->polygons [{:keys [positions indices normals]}]
   (mapv (fn [[a b c]]
           (let [face-normal (normalize (cross (v- (nth positions b) (nth positions a))
@@ -130,13 +141,38 @@
                            [a b c]))))
         (partition 3 indices)))
 
-(defn- polygons->mesh [polygons]
-  (let [triangles (mapcat (fn [poly]
-                            (let [vertices (:vertices poly)]
-                              (map (fn [i] [(first vertices) (nth vertices i) (nth vertices (inc i))])
-                                   (range 1 (dec (count vertices))))))
-                          polygons)
-        vertices (vec (mapcat identity triangles))]
+(defn- basis-2d
+  "An orthonormal in-plane basis for `normal`, used to project a polygon to 2D
+  so it can be triangulated by an ear-clipper rather than a fan."
+  [normal]
+  (let [a (if (< (#?(:clj Math/abs :cljs js/Math.abs) (nth normal 0)) 0.9)
+            [1.0 0.0 0.0] [0.0 1.0 0.0])
+        e1 (normalize (cross normal a))]
+    [e1 (cross normal e1)]))
+
+(defn- polygons->mesh
+  "Triangulate BSP output polygons.
+
+  A fan from vertex 0 is only correct for a CONVEX polygon. The polygons a
+  boolean produces are routinely concave — the top face of a box with a corner
+  notched out is L-shaped — and a fan over one of those emits triangles that
+  cover area outside the polygon and miss area inside it, which shows up
+  downstream as boundary edges where the surface should be closed. Projecting
+  onto the polygon's own plane and ear-clipping via `brep.polygon` handles both."
+  [polygons]
+  (let [tris (mapcat
+              (fn [poly]
+                (let [verts (:vertices poly)
+                      n (get-in poly [:plane :normal])
+                      [e1 e2] (basis-2d n)
+                      origin (:position (first verts))
+                      to-2d (fn [{:keys [position]}]
+                              (let [d (v- position origin)]
+                                [(dot d e1) (dot d e2)]))
+                      {:keys [indices]} (poly/triangulate-rings [(mapv to-2d verts)])]
+                  (map (fn [i] (nth verts i)) indices)))
+              polygons)
+        vertices (vec tris)]
     {:positions (mapv :position vertices)
      :normals (mapv :normal vertices)
      :indices (vec (range (count vertices)))}))
@@ -156,32 +192,41 @@
   edges. Welding and orienting first makes that case, and a union of two boxes
   sharing a face, come back closed.
 
-  ⚠ **The result is still not watertight in every case.** Booleans whose
-  operands actually cut each other leak, measured as of 2026-08-21:
+  The operands are also coplanar-MERGED before the tree is built. csg.js takes
+  a cube as six quads; a tessellated solid arrives as twelve triangles, so every
+  plane that should cut one polygon cuts two and the extra fragments fall below
+  the three-vertex floor in `split-polygon`. `brep.topology/merge-coplanar` puts
+  the faces back together first.
 
-      union, disjoint / touching        closed
-      union, overlapping                18 boundary edges (6 T-junctions, 12 holes)
-      difference, no overlap            closed
-      difference, through hole          28 boundary edges (8 T-junctions, 20 holes)
-      difference, corner notch          14 boundary edges (6 T-junctions, 8 holes)
-      intersection, overlapping         closed
+  ⚠ **The result is still not watertight when the operands cut each other.**
+  Measured 2026-08-21, before and after the merge:
 
-  So part of the damage is T-junctions — vertices sitting in the middle of a
-  neighbouring triangle's edge, where the surface is geometrically closed but
-  topologically cracked — and the larger part is polygons that are simply gone.
-  The transcription of the csg.js algorithm here has been checked against the
-  original step by step and matches it; the leading suspect is that this
-  function is fed TRIANGLES where csg.js is fed quads, so each planar face
-  arrives already split and its fragments fall below the three-vertex floor in
-  `split-polygon`. Feeding it coplanar-merged polygons is the next thing to try.
-  `brep.topology` is what can both merge them and check the answer.
+                                    before merge            after merge
+      union, disjoint / touching    closed                  closed
+      union, overlapping            18 bd (6 T, 12 holes)   20 bd (8 T, 12 holes)
+      difference, no overlap        closed                  closed
+      difference, through hole      28 bd (8 T, 20 holes)   20 bd (6 T, 14 holes)
+      difference, corner notch      14 bd (6 T,  8 holes)    6 bd (2 T,  4 holes)
+      intersection, overlapping     closed (16 tris)        closed (12 tris)
+
+  So the merge helps — the notch dropped from 14 boundary edges to 6 — but does
+  not close the cutting cases. The remainder is still mostly polygons that are
+  simply gone rather than T-junctions, so the next suspect is inside the BSP
+  clip/build itself rather than the shape of its input.
+
+  Two things ruled OUT along the way, recorded so they are not re-tried:
+  the csg.js transcription (checked against the original step by step: union,
+  subtract, intersect, clipPolygons, clipTo, invert, build all match), and the
+  fan triangulation of the output (replacing it with `brep.polygon`'s ear
+  clipper changed none of the numbers above — the output polygons in these
+  cases are already convex).
 
   Until then: check the result with `brep.topology/topology` before relying on
   it being a solid. Volume, STEP export, machining stock and printing all
   depend on closure, and this does not yet provide it in the cutting cases."
   [operation mesh-a mesh-b]
-  (let [a (build-node (mesh->polygons (topo/welded-oriented mesh-a)))
-        b (build-node (mesh->polygons (topo/welded-oriented mesh-b)))
+  (let [a (build-node (merged->polygons (topo/merge-coplanar (topo/welded-oriented mesh-a))))
+        b (build-node (merged->polygons (topo/merge-coplanar (topo/welded-oriented mesh-b))))
         result
         (case operation
           :union (let [a1 (clip-to a b)

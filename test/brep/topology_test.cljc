@@ -136,3 +136,31 @@
       (is (not (:closed? (closure :difference big (box-mesh-at 8 8 12 12 -1 6))))))
     (testing "and the extrusion they all start from is closed, so the pipeline is not at fault"
       (is (:manifold? (topo/topology (box-mesh-at 0 0 10 10 0 4)))))))
+
+(deftest coplanar-merge-puts-the-faces-back-together
+  ;; csg.js takes a cube as six quads. A tessellated solid arrives as twelve
+  ;; triangles, so every plane that should cut one polygon cuts two, and the
+  ;; extra fragments fall below the three-vertex floor in the BSP's splitter.
+  ;; This is the inverse operation, applied before a boolean.
+  (let [polys (topo/merge-coplanar (box-mesh))]
+    (testing "12 triangles become the box's own 6 quads"
+      (is (= 6 (count polys)))
+      (is (= [4 4 4 4 4 4] (mapv count polys))))
+
+    (testing "every merged loop winds with the faces it came from"
+      ;; `region-loop` chains border edges without regard to winding, so half the
+      ;; loops come back reversed unless they are re-oriented — which would
+      ;; reintroduce at the polygon level the defect `orient-faces` removes at
+      ;; the face level. Leaving it out turned three closed boolean cases open.
+      (let [centre [2.0 2.0 1.5]
+            outward? (fn [pts]
+                       (let [n (topo/-loop-normal pts)]
+                         (pos? (reduce + (map * n (mapv - (first pts) centre))))))]
+        (is (every? outward? polys))))
+
+    (testing "a region whose boundary is not one simple loop stays triangulated"
+      ;; Two triangles meeting only at a point share no edge, so they are two
+      ;; regions, not one polygon with a pinch.
+      (let [pinched {:positions [[0 0 0] [1 0 0] [0 1 0] [-1 0 0] [0 -1 0]]
+                     :indices [0 1 2 0 3 4]}]
+        (is (= 2 (count (topo/merge-coplanar pinched))))))))
