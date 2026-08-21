@@ -818,6 +818,128 @@
                                            (topo/half-space-box origin normal extent)))
                        acc planes)])))))
 
+(defn- region-planes
+  "One `[point outward-normal]` per coplanar face region of `topo`.
+
+  The regions come from `brep.topology/coplanar-regions`, so a box arrives as
+  six planes rather than the twelve its triangles would give — offsetting a
+  plane twice is harmless for the intersection below, but the error messages
+  would count faces that a reader of the model does not believe exist."
+  [topo]
+  (mapv (fn [region]
+          (let [fi (first region)]
+            [(nth (:vertices topo) (first (nth (:faces topo) fi)))
+             (face-normal-of topo fi)]))
+        (topo/coplanar-regions topo)))
+
+(defn- convex-body?
+  "Every vertex on the inner side of every face plane, within `tol`."
+  [topo planes tol]
+  (every? (fn [[p n]]
+            (every? #(<= (k/v-dot n (k/v- % p)) tol) (:vertices topo)))
+          planes))
+
+(defmethod apply-feature :shell [feature _ctx acc]
+  ;; Hollowing a solid is an inward OFFSET followed by a difference. This kernel
+  ;; has no offset surface, so the inner body is built the only way planar faces
+  ;; allow: intersect each face's own plane pushed inward by the wall thickness.
+  ;;
+  ;; That construction is the true inward offset for a CONVEX body and is WRONG
+  ;; for a concave one — at a reflex edge the two offset planes cross on the far
+  ;; side of the material and eat wall that should have stayed. The wrong answer
+  ;; is a perfectly closed solid of plausible size, so it would pass a closure
+  ;; check and a triangle count; only a volume against a known one catches it.
+  ;; Rather than return it, `:shell` refuses on a concave body and says which
+  ;; part of itself is missing.
+  (let [{:keys [thickness removed-faces]} feature
+        t (double (or thickness 0))]
+    (cond
+      (nil? acc)
+      [:error (str "shell " (:id feature) " has no body to hollow")]
+
+      (not (pos? t))
+      [:error (str "shell " (:id feature) " needs a positive :thickness (got "
+                   thickness ")")]
+
+      (not (or (nil? removed-faces) (= [] removed-faces)
+               (and (coll? removed-faces) (seq removed-faces)
+                    (every? #(and (vector? %) (= 3 (count %))
+                                  (every? number? %)) removed-faces))))
+      [:error (str "shell " (:id feature) " :removed-faces must be a collection of"
+                   " outward directions like [0 0 1] — face ids do not exist on"
+                   " the mesh this evaluates, and guessing a mapping would open"
+                   " a face nobody selected (got " (pr-str removed-faces) ")")]
+
+      :else
+      (let [body (topo/welded-oriented acc)
+            topo (topo/topology body)
+            planes (region-planes topo)
+            [lo hi] (topo/mesh-bounds body)
+            span (apply max 1.0 (map - hi lo))
+            extent (* 4.0 span)
+            matches (fn [dir]
+                      (let [d (k/v-normalize dir)]
+                        (filter (fn [[_ n]] (> (k/v-dot n d) 0.999)) planes)))
+            unmatched (remove #(seq (matches %)) (or removed-faces []))
+            open-set (set (mapcat matches (or removed-faces [])))
+            kept (remove open-set planes)]
+        (cond
+          (not (convex-body? topo planes 1.0e-6))
+          [:error (str "shell " (:id feature) " has a concave body (" (count planes)
+                       " face planes). This kernel offsets inward by intersecting"
+                       " a body's own face planes, which is the true offset only"
+                       " for a convex body — at a reflex edge two offset planes"
+                       " cross outside the material and remove wall that should"
+                       " remain, and the result is a closed solid of plausible"
+                       " size that no closure check would reject. A concave"
+                       " shell needs an offset-surface representation this"
+                       " kernel does not have.")]
+
+          (seq unmatched)
+          [:error (str "shell " (:id feature) " :removed-faces named "
+                       (pr-str (vec unmatched)) ", which matches no face of this"
+                       " body (its outward normals are "
+                       (pr-str (mapv (fn [[_ n]] (mapv #(/ (Math/round (* 1000.0 %)) 1000.0) n))
+                                     planes)) ")")]
+
+          (empty? kept)
+          [:error (str "shell " (:id feature) " opens every face — there is no"
+                       " wall left to keep")]
+
+          :else
+          (let [cavity (reduce (fn [m [p n]]
+                                 (let [inner (topo/half-space-box
+                                              (k/v+ p (k/v-scale n (- t)))
+                                              (k/v-scale n -1.0) extent)]
+                                   (if (nil? m) inner
+                                       (csg/mesh-boolean :intersection m inner))))
+                               nil kept)]
+            ;; The cavity has to BE the inward offset, and the check is the
+            ;; definition: every cavity vertex at least `t` inside every wall
+            ;; that was kept. When the offset planes cross — a thickness too
+            ;; large for the body — the intersection does not come back empty,
+            ;; it comes back as an extent-sized sliver, and subtracting that
+            ;; leaves a solid of very nearly the original volume that reports
+            ;; success. Measured on a 10-cube with thickness 9: volume 990 of
+            ;; 1000, closed, Euler 2 — a "shell" indistinguishable from the
+            ;; block it started as. The same measurement puts the worst cavity
+            ;; vertex 49 outside a wall, which is what this rejects. A genuinely
+            ;; thin cavity is not caught by it: thickness 4.9 on that cube
+            ;; leaves a 0.2 cube and the worst intrusion is 1.8e-15.
+            (let [intrusion (when (seq (:positions cavity))
+                              (apply max (for [v (:positions cavity) [p n] kept]
+                                           (+ t (k/v-dot n (k/v- v p))))))
+                  tol (* 1.0e-9 (max 1.0 span))]
+              (if (or (nil? intrusion) (> intrusion tol))
+                [:error (str "shell " (:id feature) " with thickness " t
+                             " does not fit a body spanning " span
+                             (if intrusion
+                               (str " — the offset walls cross, putting the cavity "
+                                    (/ (Math/round (* 1000.0 intrusion)) 1000.0)
+                                    " outside a wall it should stay inside")
+                               " — the offset planes enclose nothing"))]
+                [:ok (csg/mesh-boolean :difference body cavity)]))))))))
+
 (defn evaluate-mesh
   "Evaluate a feature tree to a **triangle mesh** by folding each feature
   through `apply-feature`.

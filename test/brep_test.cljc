@@ -50,9 +50,20 @@
                   (feature/add-feature
                    (feature/extrude-feature 2 1 [0.0 0.0 1.0] 10.0 :new)))]
     (is (= 2 (feature/tree-len tree)))
-    (let [[status [solid _edges _verts]] (feature/evaluate tree)]
+    (let [[status [solid edges verts]] (feature/evaluate tree)]
       (is (= :ok status))
-      (is (= 6 (k/face-count solid))))))
+      ;; 6 was the box-era answer, and this assertion kept failing at 34 long
+      ;; after the evaluator started honouring the sketch: a CIRCLE profile is
+      ;; tessellated, so the prism has 32 side faces and 2 caps. Asserting the
+      ;; face count alone cannot tell a correct 32-gon from a wrong one, so the
+      ;; claim that matters is the volume — a 32-gon of radius 5 has area
+      ;; 1/2 n r^2 sin(2 pi / n), which is 0.64% under pi r^2, and the solid
+      ;; must sit on the polygon value, not the circle one.
+      (is (= 34 (k/face-count solid)) "32 tessellated sides + 2 caps")
+      (let [n 32 poly-area (* 0.5 n 25.0 (Math/sin (/ (* 2.0 Math/PI) n)))]
+        (is (< (Math/abs (- (tessellate/volume solid edges verts) (* poly-area 10.0))) 1.0e-6))
+        (is (< (tessellate/volume solid edges verts) (* Math/PI 25.0 10.0))
+            "a tessellated circle is inscribed, so it is under the analytic cylinder")))))
 
 ;; ── brep.feature :revolve (new — a real solid of revolution, not the
 ;; box-only evaluate this repo started with) ──
